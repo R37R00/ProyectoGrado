@@ -1,3 +1,4 @@
+from scapy.all import Ether, srp
 from scapy.layers.inet import IP, ICMP, TCP
 from scapy.layers.l2 import ARP
 
@@ -32,14 +33,45 @@ class DetectionEngine:
         except Exception as error:
             print("Error en process_packet:", error)
 
-    def detect_arp_spoof(self, packet):
-        ip = packet[ARP].psrc
-        mac = packet[ARP].hwsrc
+    def get_real_mac(self, ip):
+        try:
+            arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+            answered = srp(arp_request, timeout=2, verbose=False)[0]
+            if answered:
+                return answered[0][1].hwsrc
+        except Exception as error:
+            print(f"Error al obtener MAC real para {ip}:", error)
+        return None
 
-        if ip in self.arp_table and self.arp_table[ip] != mac:
-            self.trigger_alert(f"Posible ARP Spoofing detectado desde {ip}")
-        else:
-            self.arp_table[ip] = mac
+    def detect_arp_spoof(self, packet):
+        try:
+            if ARP not in packet or packet[ARP].op != 2:
+                return
+
+            ip = packet[ARP].psrc
+            observed_mac = packet[ARP].hwsrc
+            known_mac = self.arp_table.get(ip)
+
+            if known_mac is None:
+                self.arp_table[ip] = observed_mac
+                return
+
+            if known_mac == observed_mac:
+                return
+
+            real_mac = self.get_real_mac(ip)
+            if real_mac is None:
+                return
+
+            if observed_mac != real_mac:
+                self.trigger_alert(
+                    f"Posible ARP Spoofing detectado desde {ip} (MAC observada: {observed_mac}, MAC real: {real_mac})"
+                )
+            else:
+                self.arp_table[ip] = observed_mac
+
+        except Exception as error:
+            print("Error en detect_arp_spoof:", error)
 
     def check_dos(self):
         for ip, count in self.ip_packet_count.items():
