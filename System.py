@@ -2,7 +2,7 @@ import sys
 import threading
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QTextEdit, QPushButton, QLabel, QTabWidget, QComboBox
 from PyQt5.QtCore import pyqtSignal, QTimer
-from scapy.all import sniff, ARP, Ether, srp
+from scapy.all import sniff, ARP, Ether, srp, get_if_list
 from scapy.layers.inet import IP, ICMP, TCP
 import socket
 import ipaddress
@@ -105,6 +105,13 @@ class MainWindow(QMainWindow):
         self.packet_count = 0
         self.protocol_counts = {}
         self.anomaly_detected = False
+        self.capture_interface = None
+
+        self.packet_received_signal.connect(self.update_packet_display)
+        self.anomaly_detected_signal.connect(self.update_anomaly_display)
+        self.hosts_found_signal.connect(self.update_hosts_display)
+
+        self.load_network_interfaces()
 
     def init_ui(self):
         main_widget = QWidget()
@@ -155,6 +162,10 @@ class MainWindow(QMainWindow):
         self.hosts_combo_box = QComboBox()
         find_hosts_layout.addWidget(self.hosts_combo_box)
 
+        self.interface_combo_box = QComboBox()
+        self.interface_combo_box.currentTextChanged.connect(self.on_interface_selected)
+        find_hosts_layout.addWidget(self.interface_combo_box)
+
         self.block_connection_button = QPushButton("Cortar Conexión")
         self.block_connection_button.clicked.connect(self.block_selected_connection)
         find_hosts_layout.addWidget(self.block_connection_button)
@@ -162,6 +173,13 @@ class MainWindow(QMainWindow):
         self.find_hosts_button = QPushButton("Buscar Hosts")
         self.find_hosts_button.clicked.connect(self.find_hosts)
         find_hosts_layout.addWidget(self.find_hosts_button)
+
+        self.interface_status_label = QLabel("Interfaz de captura: detectando...")
+        find_hosts_layout.addWidget(self.interface_status_label)
+
+        self.refresh_interfaces_button = QPushButton("Actualizar interfaces")
+        self.refresh_interfaces_button.clicked.connect(self.load_network_interfaces)
+        find_hosts_layout.addWidget(self.refresh_interfaces_button)
 
         find_hosts_tab.setLayout(find_hosts_layout)
         tab_widget.addTab(find_hosts_tab, "Buscar Hosts en la Red")
@@ -185,6 +203,47 @@ class MainWindow(QMainWindow):
 
     def update_packet_display(self, packet_summary):
         self.packet_text_edit.append(packet_summary)
+
+    def on_interface_selected(self, interface_name):
+        if interface_name:
+            self.capture_interface = interface_name
+            self.interface_status_label.setText(f"Interfaz seleccionada: {interface_name}")
+
+    def load_network_interfaces(self):
+        try:
+            interfaces = [iface for iface in get_if_list() if iface and iface.lower() != "lo"]
+            self.interface_combo_box.clear()
+
+            if not interfaces:
+                self.capture_interface = None
+                self.interface_status_label.setText("No se detectaron interfaces de red disponibles")
+                return
+
+            self.interface_combo_box.addItems(interfaces)
+
+            # Si solo hay una, usarla automáticamente.
+            if len(interfaces) == 1:
+                self.capture_interface = interfaces[0]
+                self.interface_combo_box.setCurrentIndex(0)
+                self.interface_status_label.setText(f"Interfaz detectada automáticamente: {self.capture_interface}")
+                return
+
+            # Si hay más de una, priorizar la de Scapy (ruta por defecto) y como fallback la primera.
+            default_iface = str(conf.iface) if conf.iface else None
+            if default_iface in interfaces:
+                self.capture_interface = default_iface
+                self.interface_combo_box.setCurrentText(default_iface)
+            else:
+                self.capture_interface = interfaces[0]
+                self.interface_combo_box.setCurrentIndex(0)
+
+            self.interface_status_label.setText(
+                f"Varias interfaces detectadas. Se usará por defecto: {self.capture_interface}"
+            )
+
+        except Exception as e:
+            self.capture_interface = None
+            self.interface_status_label.setText(f"Error al detectar interfaces: {e}")
 
     def update_anomaly_display(self, anomaly_message):
         self.anomaly_label.setText(anomaly_message)
@@ -219,7 +278,13 @@ class MainWindow(QMainWindow):
 
     def start_capture(self, packet_handler):
         try:
-            sniff(iface="Qualcomm Atheros AR956x Wireless Network Adapter", prn=packet_handler, stop_filter=self.should_stop)
+            if not self.capture_interface:
+                self.load_network_interfaces()
+
+            if not self.capture_interface:
+                raise RuntimeError("No hay interfaz de red disponible para capturar")
+
+            sniff(iface=self.capture_interface, prn=packet_handler, stop_filter=self.should_stop)
         except Exception as e:
             print("Error en la captura de paquetes:", e)
 
