@@ -1,4 +1,5 @@
 from PyQt5.QtCore import Qt, pyqtSignal
+import logging
 from PyQt5.QtWidgets import (
     QComboBox,
     QLabel,
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
         capture_layout.addWidget(self.capture_interface_label)
 
         self.capture_interface_combo_box = QComboBox()
+        self.capture_interface_combo_box.currentIndexChanged.connect(self.on_interface_selected)
         capture_layout.addWidget(self.capture_interface_combo_box)
 
         self.packet_text_edit = QTextEdit()
@@ -106,6 +108,15 @@ class MainWindow(QMainWindow):
         self.capture_interface_combo_box.clear()
         for friendly_name, real_name in interfaces:
             self.capture_interface_combo_box.addItem(friendly_name, real_name)
+
+    def on_interface_selected(self):
+        visible_name = self.capture_interface_combo_box.currentText()
+        real_identifier = self.capture_interface_combo_box.currentData()
+        logging.debug(
+            "Interfaz seleccionada por usuario -> visible='%s' real='%s'",
+            visible_name,
+            real_identifier,
+        )
 
     def get_selected_capture_interface(self):
         if self.capture_interface_combo_box.count() == 0:

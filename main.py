@@ -1,54 +1,39 @@
-import re
+import logging
 import sys
 
-import psutil
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
-from scapy.all import conf, get_if_list
+from scapy.all import conf
 
 from detection_engine import DetectionEngine
 from interfaz_grafica import MainWindow
 from network_capture import NetworkCaptureScanner
 
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+
 def get_friendly_interfaces():
     interfaces = []
     try:
-        scapy_interfaces = get_if_list()
-        os_interfaces = list(psutil.net_if_addrs().keys())
-
-        for npf_name in scapy_interfaces:
-            if not npf_name:
+        for iface in conf.ifaces.values():
+            real_name = getattr(iface, "name", None)
+            if not real_name:
                 continue
 
-            friendly_name = npf_name
-            guid_match = re.search(r"\{[0-9A-Fa-f\-]+\}", npf_name)
-
-            if guid_match:
-                guid = guid_match.group(0).strip("{}").lower()
-                mapped_name = next(
-                    (
-                        name
-                        for name in os_interfaces
-                        if guid in name.lower()
-                    ),
-                    None,
-                )
-                if mapped_name:
-                    friendly_name = mapped_name
-                else:
-                    friendly_name = f"Interfaz ({guid_match.group(0)})"
-
-            interfaces.append((friendly_name, npf_name))
-
+            friendly_name = getattr(iface, "description", "") or real_name
+            interfaces.append((friendly_name, real_name))
     except Exception as error:
-        print("Error al obtener interfaces amigables:", error)
+        logging.error("Error al obtener interfaces amigables: %s", error)
 
-    # Evitar duplicados preservando el identificador real (npf)
     unique = {}
-    for friendly_name, npf_name in interfaces:
-        unique[npf_name] = friendly_name
+    for friendly_name, real_name in interfaces:
+        if real_name not in unique:
+            unique[real_name] = friendly_name
 
-    return [(friendly_name, npf_name) for npf_name, friendly_name in unique.items()]
+    return [(friendly_name, real_name) for real_name, friendly_name in unique.items()]
 
 
 class AppController:

@@ -1,6 +1,7 @@
 import ipaddress
 import socket
 import threading
+import logging
 
 from scapy.all import sniff, ARP, Ether, srp
 from scapy.layers.inet import IP
@@ -29,6 +30,7 @@ class NetworkCaptureScanner:
 
     def start_capture(self):
         try:
+            logging.info("Iniciando captura en interfaz real: %s", self.interface)
             sniff(iface=self.interface, prn=self._handle_packet, stop_filter=self.should_stop)
         except Exception as error:
             print("Error en la captura de paquetes:", error)
