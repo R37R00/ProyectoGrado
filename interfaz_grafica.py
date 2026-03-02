@@ -45,6 +45,12 @@ class MainWindow(QMainWindow):
         capture_tab = QWidget()
         capture_layout = QVBoxLayout(capture_tab)
 
+        self.capture_interface_label = QLabel("Interfaz de captura")
+        capture_layout.addWidget(self.capture_interface_label)
+
+        self.capture_interface_combo_box = QComboBox()
+        capture_layout.addWidget(self.capture_interface_combo_box)
+
         self.packet_text_edit = QTextEdit()
         self.packet_text_edit.setReadOnly(True)
         capture_layout.addWidget(self.packet_text_edit)
@@ -95,6 +101,22 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(tab_widget)
         self.setCentralWidget(main_widget)
+
+    def set_capture_interfaces(self, interfaces):
+        self.capture_interface_combo_box.clear()
+        for friendly_name, real_name in interfaces:
+            self.capture_interface_combo_box.addItem(friendly_name, real_name)
+
+    def get_selected_capture_interface(self):
+        if self.capture_interface_combo_box.count() == 0:
+            return None
+        return self.capture_interface_combo_box.currentData()
+
+    def set_selected_capture_interface(self, real_name):
+        for index in range(self.capture_interface_combo_box.count()):
+            if self.capture_interface_combo_box.itemData(index) == real_name:
+                self.capture_interface_combo_box.setCurrentIndex(index)
+                return
 
     def bind_actions(self, pause_callback, continue_callback, stop_callback, find_hosts_callback, block_host_callback):
         self._pause_callback = pause_callback
