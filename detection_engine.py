@@ -1,6 +1,7 @@
-from scapy.all import Ether, srp
+import logging
+
+from scapy.all import ARP, sr1
 from scapy.layers.inet import IP, ICMP, TCP
-from scapy.layers.l2 import ARP
 
 
 class DetectionEngine:
@@ -9,6 +10,7 @@ class DetectionEngine:
         self.syn_counter = 0
         self.ip_packet_count = {}
         self.arp_table = {}
+        self.mac_table = {}
         self.alert_callback = None
 
     def set_alert_callback(self, callback):
@@ -27,51 +29,61 @@ class DetectionEngine:
                 if ICMP in packet and packet[ICMP].type == 8:
                     self.trigger_alert(f"Actividad ICMP sospechosa desde {src_ip}")
 
-            if ARP in packet and packet[ARP].op == 2:
-                self.detect_arp_spoof(packet)
+            if packet.haslayer(ARP):
+                self.detect_arp_spoofing(packet)
 
         except Exception as error:
-            print("Error en process_packet:", error)
+            logging.error("Error en process_packet: %s", error)
 
-    def get_real_mac(self, ip):
+    def active_arp_verification(self, ip, expected_mac):
         try:
-            arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
-            answered = srp(arp_request, timeout=2, verbose=False)[0]
-            if answered:
-                return answered[0][1].hwsrc
+            logging.debug("Verificación ARP activa para IP %s con MAC esperada %s", ip, expected_mac)
+            response = sr1(ARP(op=1, pdst=ip), timeout=2, verbose=False)
+            if response and response.haslayer(ARP):
+                verified_mac = response[ARP].hwsrc
+                logging.debug("Respuesta verificada para IP %s: MAC %s", ip, verified_mac)
+                return verified_mac.lower() == expected_mac.lower()
         except Exception as error:
-            print(f"Error al obtener MAC real para {ip}:", error)
-        return None
+            logging.error("Error en verificación ARP activa para %s: %s", ip, error)
+        return False
 
-    def detect_arp_spoof(self, packet):
+    def detect_arp_spoofing(self, packet):
         try:
-            if ARP not in packet or packet[ARP].op != 2:
+            arp_layer = packet[ARP]
+            src_ip = arp_layer.psrc
+            src_mac = arp_layer.hwsrc
+
+            if not src_ip or not src_mac:
                 return
 
-            ip = packet[ARP].psrc
-            observed_mac = packet[ARP].hwsrc
-            known_mac = self.arp_table.get(ip)
+            known_mac = self.arp_table.get(src_ip)
 
             if known_mac is None:
-                self.arp_table[ip] = observed_mac
-                return
-
-            if known_mac == observed_mac:
-                return
-
-            real_mac = self.get_real_mac(ip)
-            if real_mac is None:
-                return
-
-            if observed_mac != real_mac:
+                self.arp_table[src_ip] = src_mac
+                logging.debug("Nueva asociación IP-MAC registrada: %s -> %s", src_ip, src_mac)
+            elif known_mac.lower() != src_mac.lower():
                 self.trigger_alert(
-                    f"Posible ARP Spoofing detectado desde {ip} (MAC observada: {observed_mac}, MAC real: {real_mac})"
+                    f"Posible ARP Spoofing detectado: IP {src_ip} cambió de MAC {known_mac} a {src_mac}"
                 )
-            else:
-                self.arp_table[ip] = observed_mac
+                logging.debug("Cambio detectado para IP %s: %s -> %s", src_ip, known_mac, src_mac)
+
+                if not self.active_arp_verification(src_ip, known_mac):
+                    self.trigger_alert(f"ARP Spoofing confirmado para IP {src_ip}")
+                else:
+                    self.arp_table[src_ip] = src_mac
+
+            ips_for_mac = self.mac_table.setdefault(src_mac, set())
+            ips_for_mac.add(src_ip)
+
+            if len(ips_for_mac) > 1:
+                ips_list = ", ".join(sorted(ips_for_mac))
+                self.trigger_alert(f"Advertencia: MAC {src_mac} anuncia múltiples IP: {ips_list}")
 
         except Exception as error:
-            print("Error en detect_arp_spoof:", error)
+            logging.error("Error en detect_arp_spoofing: %s", error)
+
+    def detect_arp_spoof(self, packet):
+        self.detect_arp_spoofing(packet)
 
     def check_dos(self):
         for ip, count in self.ip_packet_count.items():
