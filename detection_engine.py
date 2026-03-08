@@ -47,6 +47,21 @@ class DetectionEngine:
             logging.error("Error en verificación ARP activa para %s: %s", ip, error)
         return False
 
+    def _update_mac_table(self, ip, new_mac, old_mac=None):
+        if old_mac:
+            old_ips = self.mac_table.get(old_mac, set())
+            old_ips.discard(ip)
+            if not old_ips and old_mac in self.mac_table:
+                del self.mac_table[old_mac]
+
+        ips_for_mac = self.mac_table.setdefault(new_mac, set())
+        ips_for_mac.add(ip)
+
+    def _find_possible_attacker_ip(self, suspicious_mac, spoofed_ip):
+        known_ips = self.mac_table.get(suspicious_mac, set())
+        candidates = sorted(ip for ip in known_ips if ip != spoofed_ip)
+        return candidates[0] if candidates else None
+
     def detect_arp_spoofing(self, packet):
         try:
             arp_layer = packet[ARP]
@@ -60,21 +75,36 @@ class DetectionEngine:
 
             if known_mac is None:
                 self.arp_table[src_ip] = src_mac
+                self._update_mac_table(src_ip, src_mac)
                 logging.debug("Nueva asociación IP-MAC registrada: %s -> %s", src_ip, src_mac)
-            elif known_mac.lower() != src_mac.lower():
-                self.trigger_alert(
-                    f"Posible ARP Spoofing detectado: IP {src_ip} cambió de MAC {known_mac} a {src_mac}"
-                )
-                logging.debug("Cambio detectado para IP %s: %s -> %s", src_ip, known_mac, src_mac)
+                return
 
-                if not self.active_arp_verification(src_ip, known_mac):
-                    self.trigger_alert(f"ARP Spoofing confirmado para IP {src_ip}")
-                else:
-                    self.arp_table[src_ip] = src_mac
+            if known_mac.lower() == src_mac.lower():
+                self._update_mac_table(src_ip, src_mac)
+                return
+
+            logging.debug("Cambio detectado para IP %s: %s -> %s", src_ip, known_mac, src_mac)
+            possible_attacker_ip = self._find_possible_attacker_ip(src_mac, src_ip)
+
+            alert_lines = [
+                "ARP SPOOFING DETECTED",
+                f"Spoofed IP: {src_ip}",
+                f"Original MAC: {known_mac}",
+                f"Suspicious MAC (possible attacker): {src_mac}",
+            ]
+            if possible_attacker_ip:
+                alert_lines.append(f"Possible attacker IP: {possible_attacker_ip}")
+
+            self.trigger_alert("\n".join(alert_lines))
+
+            if not self.active_arp_verification(src_ip, known_mac):
+                self.trigger_alert(f"ARP Spoofing confirmado para IP {src_ip}")
+            else:
+                self.arp_table[src_ip] = src_mac
+                self._update_mac_table(src_ip, src_mac, old_mac=known_mac)
 
             ips_for_mac = self.mac_table.setdefault(src_mac, set())
             ips_for_mac.add(src_ip)
-
             if len(ips_for_mac) > 1:
                 ips_list = ", ".join(sorted(ips_for_mac))
                 self.trigger_alert(f"Advertencia: MAC {src_mac} anuncia múltiples IP: {ips_list}")
