@@ -1,5 +1,6 @@
-from PyQt5.QtCore import Qt, pyqtSignal
 import logging
+
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
     QLabel,
@@ -170,8 +171,21 @@ class MainWindow(QMainWindow):
         self.packet_text_edit.append(packet_summary)
 
     def update_anomaly_display(self, anomaly_message):
-        self.anomaly_label.setText(anomaly_message)
-        self.attacker_ip_label.setText("Atacante: " + anomaly_message.split()[-1])
+        attacker_mac = "N/A"
+        spoofed_ip = "N/A"
+
+        for line in anomaly_message.splitlines():
+            if line.startswith("Attacker MAC:"):
+                attacker_mac = line.split(":", 1)[1].strip()
+            elif line.startswith("Spoofed IP:"):
+                spoofed_ip = line.split(":", 1)[1].strip()
+
+        if attacker_mac != "N/A" and spoofed_ip != "N/A":
+            self.anomaly_label.setText("⚠ ARP Spoofing Detected")
+            self.attacker_ip_label.setText(f"Attacker MAC: {attacker_mac} | Spoofed IP: {spoofed_ip}")
+        else:
+            self.anomaly_label.setText(anomaly_message)
+            self.attacker_ip_label.setText("")
 
     def update_hosts_display(self, hosts):
         self.hosts_text_edit.clear()

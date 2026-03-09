@@ -1,8 +1,11 @@
 import logging
+import queue
 import sys
 
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from scapy.all import conf
+from scapy.layers.l2 import ARP
 
 from detection_engine import DetectionEngine
 from interfaz_grafica import MainWindow
@@ -42,6 +45,13 @@ class AppController:
 
         self.window = MainWindow()
         self.detection_engine = DetectionEngine()
+        self.packet_event_queue = queue.Queue()
+
+        self.window.packet_text_edit.document().setMaximumBlockCount(200)
+
+        self.packet_flush_timer = QTimer()
+        self.packet_flush_timer.setInterval(300)
+        self.packet_flush_timer.timeout.connect(self.flush_packet_events)
 
         self.friendly_interfaces = get_friendly_interfaces()
         self.window.set_capture_interfaces(self.friendly_interfaces)
@@ -53,7 +63,7 @@ class AppController:
             interface=selected_interface,
         )
 
-        self.detection_engine.set_alert_callback(self.window.handle_alert)
+        self.detection_engine.set_alert_callback(self.handle_alert)
         self.window.bind_actions(
             pause_callback=self.pause_capture,
             continue_callback=self.continue_capture,
@@ -62,12 +72,31 @@ class AppController:
             block_host_callback=self.block_attacker_connection,
         )
 
+    def should_display_packet(self, packet):
+        return ARP in packet
+
     def handle_packet(self, packet):
         if self.window.capture_paused:
             return
+
         self.window.packet_count += 1
-        self.window.packet_received_signal.emit(packet.summary())
         self.detection_engine.process_packet(packet)
+
+        if self.should_display_packet(packet):
+            self.packet_event_queue.put(packet.summary())
+
+    def flush_packet_events(self):
+        displayed = 0
+        while displayed < 30:
+            try:
+                summary = self.packet_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.window.packet_received_signal.emit(summary)
+            displayed += 1
+
+    def handle_alert(self, message):
+        self.window.anomaly_detected_signal.emit(message)
 
     def pause_capture(self):
         pass
@@ -117,6 +146,7 @@ class AppController:
                 "No se pudo determinar una interfaz de captura. Se usará la interfaz por defecto de Scapy.",
             )
 
+        self.packet_flush_timer.start()
         self.window.show()
         self.network_capture.start_capture_thread()
 

@@ -1,6 +1,7 @@
 import logging
+import time
 
-from scapy.all import ARP, sr1
+from scapy.all import ARP, Ether, srp
 from scapy.layers.inet import IP, ICMP, TCP
 
 
@@ -9,8 +10,13 @@ class DetectionEngine:
         self.packet_counter = 0
         self.syn_counter = 0
         self.ip_packet_count = {}
+
         self.arp_table = {}
         self.mac_table = {}
+        self.suspicious_arp_events = {}
+        self.arp_suspicion_window_s = 5
+        self.arp_suspicion_threshold = 3
+
         self.alert_callback = None
 
     def set_alert_callback(self, callback):
@@ -35,79 +41,109 @@ class DetectionEngine:
         except Exception as error:
             logging.error("Error en process_packet: %s", error)
 
-    def active_arp_verification(self, ip, expected_mac):
+    def active_arp_verification(self, ip, previous_mac, observed_mac):
         try:
-            logging.debug("Verificación ARP activa para IP %s con MAC esperada %s", ip, expected_mac)
-            response = sr1(ARP(op=1, pdst=ip), timeout=2, verbose=False)
-            if response and response.haslayer(ARP):
-                verified_mac = response[ARP].hwsrc
-                logging.debug("Respuesta verificada para IP %s: MAC %s", ip, verified_mac)
-                return verified_mac.lower() == expected_mac.lower()
+            arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=1, pdst=ip)
+            answered = srp(arp_request, timeout=2, verbose=False)[0]
+            if not answered:
+                return False
+
+            verified_mac = answered[0][1][ARP].hwsrc
+            logging.debug(
+                "Verificación ARP para %s: previous=%s observed=%s verified=%s",
+                ip,
+                previous_mac,
+                observed_mac,
+                verified_mac,
+            )
+            return verified_mac.lower() != previous_mac.lower()
         except Exception as error:
             logging.error("Error en verificación ARP activa para %s: %s", ip, error)
-        return False
+            return False
 
     def _update_mac_table(self, ip, new_mac, old_mac=None):
         if old_mac:
-            old_ips = self.mac_table.get(old_mac, set())
-            old_ips.discard(ip)
-            if not old_ips and old_mac in self.mac_table:
+            previous_ips = self.mac_table.get(old_mac, set())
+            previous_ips.discard(ip)
+            if not previous_ips and old_mac in self.mac_table:
                 del self.mac_table[old_mac]
 
-        ips_for_mac = self.mac_table.setdefault(new_mac, set())
-        ips_for_mac.add(ip)
+        self.mac_table.setdefault(new_mac, set()).add(ip)
 
-    def _find_possible_attacker_ip(self, suspicious_mac, spoofed_ip):
-        known_ips = self.mac_table.get(suspicious_mac, set())
-        candidates = sorted(ip for ip in known_ips if ip != spoofed_ip)
-        return candidates[0] if candidates else None
+    def _register_suspicious_event(self, ip):
+        now = time.time()
+        events = self.suspicious_arp_events.setdefault(ip, [])
+        events.append(now)
+        cutoff = now - self.arp_suspicion_window_s
+        self.suspicious_arp_events[ip] = [event for event in events if event >= cutoff]
+        return len(self.suspicious_arp_events[ip])
+
+    def _get_possible_attacker_ip(self, suspicious_mac, spoofed_ip):
+        possible_ips = [ip for ip in self.mac_table.get(suspicious_mac, set()) if ip != spoofed_ip]
+        if not possible_ips:
+            return None
+        return sorted(possible_ips)[0]
 
     def detect_arp_spoofing(self, packet):
         try:
             arp_layer = packet[ARP]
-            src_ip = arp_layer.psrc
-            src_mac = arp_layer.hwsrc
-
-            if not src_ip or not src_mac:
+            if arp_layer.op != 2:
                 return
 
-            known_mac = self.arp_table.get(src_ip)
+            sender_ip = arp_layer.psrc
+            sender_mac = arp_layer.hwsrc
+            attacker_mac = packet[Ether].src if packet.haslayer(Ether) else sender_mac
+            if not sender_ip or not sender_mac or not attacker_mac:
+                return
 
+            known_mac = self.arp_table.get(sender_ip)
             if known_mac is None:
-                self.arp_table[src_ip] = src_mac
-                self._update_mac_table(src_ip, src_mac)
-                logging.debug("Nueva asociación IP-MAC registrada: %s -> %s", src_ip, src_mac)
+                self.arp_table[sender_ip] = sender_mac
+                self._update_mac_table(sender_ip, sender_mac)
+                logging.debug("Nueva asociación ARP: %s -> %s", sender_ip, sender_mac)
                 return
 
-            if known_mac.lower() == src_mac.lower():
-                self._update_mac_table(src_ip, src_mac)
+            if known_mac.lower() == sender_mac.lower():
+                self._update_mac_table(sender_ip, sender_mac)
                 return
 
-            logging.debug("Cambio detectado para IP %s: %s -> %s", src_ip, known_mac, src_mac)
-            possible_attacker_ip = self._find_possible_attacker_ip(src_mac, src_ip)
+            suspicion_count = self._register_suspicious_event(sender_ip)
+            logging.debug(
+                "Cambio ARP sospechoso para %s (%s -> %s), attacker=%s, ocurrencias=%s",
+                sender_ip,
+                known_mac,
+                sender_mac,
+                attacker_mac,
+                suspicion_count,
+            )
 
+            if suspicion_count < self.arp_suspicion_threshold:
+                return
+
+            if not self.active_arp_verification(sender_ip, known_mac, sender_mac):
+                return
+
+            possible_attacker_ip = self._get_possible_attacker_ip(attacker_mac, sender_ip)
             alert_lines = [
-                "ARP SPOOFING DETECTED",
-                f"Spoofed IP: {src_ip}",
-                f"Original MAC: {known_mac}",
-                f"Suspicious MAC (possible attacker): {src_mac}",
+                "[ALERT] ARP Spoofing detected",
+                f"Attacker MAC: {attacker_mac}",
+                f"Spoofed IP: {sender_ip}",
+                f"Previous MAC: {known_mac}",
+                f"New MAC: {sender_mac}",
             ]
             if possible_attacker_ip:
                 alert_lines.append(f"Possible attacker IP: {possible_attacker_ip}")
 
             self.trigger_alert("\n".join(alert_lines))
 
-            if not self.active_arp_verification(src_ip, known_mac):
-                self.trigger_alert(f"ARP Spoofing confirmado para IP {src_ip}")
-            else:
-                self.arp_table[src_ip] = src_mac
-                self._update_mac_table(src_ip, src_mac, old_mac=known_mac)
+            self.arp_table[sender_ip] = sender_mac
+            self._update_mac_table(sender_ip, sender_mac, old_mac=known_mac)
 
-            ips_for_mac = self.mac_table.setdefault(src_mac, set())
-            ips_for_mac.add(src_ip)
-            if len(ips_for_mac) > 1:
-                ips_list = ", ".join(sorted(ips_for_mac))
-                self.trigger_alert(f"Advertencia: MAC {src_mac} anuncia múltiples IP: {ips_list}")
+            suspicious_ips = self.mac_table.setdefault(attacker_mac, set())
+            suspicious_ips.add(sender_ip)
+            if len(suspicious_ips) > 1:
+                ips_list = ", ".join(sorted(suspicious_ips))
+                self.trigger_alert(f"Advertencia: MAC {attacker_mac} anuncia múltiples IP: {ips_list}")
 
         except Exception as error:
             logging.error("Error en detect_arp_spoofing: %s", error)
