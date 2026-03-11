@@ -1,10 +1,8 @@
 import ipaddress
 import logging
 import socket
-import threading
 
-from scapy.all import sniff, ARP, Ether, srp
-from scapy.layers.inet import IP
+from scapy.all import AsyncSniffer, ARP, Ether, srp
 
 
 class NetworkCaptureScanner:
@@ -12,48 +10,50 @@ class NetworkCaptureScanner:
         self.packet_callback = packet_callback
         self.hosts_callback = hosts_callback
         self.interface = interface
-        self.capture_stopped = False
-        self.capture_thread = None
+
+        self.capture_running = False
+        self.capture_paused = False
+        self.sniffer = None
 
     def start_capture_thread(self):
-        self.capture_stopped = False
-        self.capture_thread = threading.Thread(target=self.start_capture, daemon=True)
-        self.capture_thread.start()
+        self.capture_running = True
+        self.capture_paused = False
+        self.start_capture()
 
     def stop_capture(self):
-        self.capture_stopped = True
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=3)
+        self.capture_running = False
+        if self.sniffer:
+            try:
+                self.sniffer.stop()
+            except Exception as error:
+                logging.error("Error al detener captura: %s", error)
+            finally:
+                self.sniffer = None
 
-    def should_stop(self, _packet):
-        return self.capture_stopped
+    def pause_capture(self):
+        self.capture_paused = True
+
+    def resume_capture(self):
+        self.capture_paused = False
 
     def start_capture(self):
         try:
             logging.info("Iniciando captura en interfaz real: %s", self.interface)
-            sniff(
+            self.sniffer = AsyncSniffer(
                 iface=self.interface,
-                filter="arp or ip",
                 prn=self._handle_packet,
                 store=False,
-                stop_filter=self.should_stop,
             )
+            self.sniffer.start()
         except Exception as error:
             logging.error("Error en la captura de paquetes: %s", error)
 
     def _handle_packet(self, packet):
         try:
-            if packet is None:
+            if not self.capture_running or packet is None or self.capture_paused:
                 return
 
-            has_ip = IP in packet
-            has_arp = ARP in packet
-
-            if has_arp:
-                logging.debug("Paquete ARP recibido: %s", packet.summary())
-
-            if has_ip or has_arp:
-                self.packet_callback(packet)
+            self.packet_callback(packet)
 
         except Exception as error:
             logging.error("Error al manejar el paquete: %s", error)

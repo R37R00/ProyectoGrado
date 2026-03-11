@@ -5,7 +5,6 @@ import sys
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from scapy.all import conf
-from scapy.layers.l2 import ARP
 
 from detection_engine import DetectionEngine
 from interfaz_grafica import MainWindow
@@ -72,18 +71,11 @@ class AppController:
             block_host_callback=self.block_attacker_connection,
         )
 
-    def should_display_packet(self, packet):
-        return ARP in packet
-
     def handle_packet(self, packet):
-        if self.window.capture_paused:
-            return
-
         self.window.packet_count += 1
         self.detection_engine.process_packet(packet)
 
-        if self.should_display_packet(packet):
-            self.packet_event_queue.put(packet.summary())
+        self.packet_event_queue.put(packet.summary())
 
     def flush_packet_events(self):
         displayed = 0
@@ -95,14 +87,15 @@ class AppController:
             self.window.packet_received_signal.emit(summary)
             displayed += 1
 
+
     def handle_alert(self, message):
         self.window.anomaly_detected_signal.emit(message)
 
     def pause_capture(self):
-        pass
+        self.network_capture.pause_capture()
 
     def continue_capture(self):
-        pass
+        self.network_capture.resume_capture()
 
     def stop_capture(self):
         self.network_capture.stop_capture()

@@ -92,7 +92,7 @@ class DetectionEngine:
 
             sender_ip = arp_layer.psrc
             sender_mac = arp_layer.hwsrc
-            attacker_mac = packet[Ether].src if packet.haslayer(Ether) else sender_mac
+            attacker_mac = sender_mac
             if not sender_ip or not sender_mac or not attacker_mac:
                 return
 
@@ -108,14 +108,15 @@ class DetectionEngine:
                 return
 
             suspicion_count = self._register_suspicious_event(sender_ip)
-            logging.debug(
-                "Cambio ARP sospechoso para %s (%s -> %s), attacker=%s, ocurrencias=%s",
-                sender_ip,
-                known_mac,
-                sender_mac,
-                attacker_mac,
-                suspicion_count,
+            suspicious_message = (
+                "Posible ARP spoofing detectado\n"
+                f"Spoofed IP: {sender_ip}\n"
+                f"Previous MAC: {known_mac}\n"
+                f"New MAC: {sender_mac}\n"
+                f"Attacker MAC: {attacker_mac}\n"
+                f"Ocurrencias en ventana: {suspicion_count}/{self.arp_suspicion_threshold}"
             )
+            self.trigger_alert(suspicious_message)
 
             if suspicion_count < self.arp_suspicion_threshold:
                 return

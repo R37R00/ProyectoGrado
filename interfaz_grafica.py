@@ -61,8 +61,10 @@ class MainWindow(QMainWindow):
         self.anomaly_label = QLabel()
         capture_layout.addWidget(self.anomaly_label)
 
-        self.attacker_ip_label = QLabel()
-        capture_layout.addWidget(self.attacker_ip_label)
+        self.anomaly_text = QTextEdit()
+        self.anomaly_text.setReadOnly(True)
+        self.anomaly_text.document().setMaximumBlockCount(200)
+        capture_layout.addWidget(self.anomaly_text)
 
         self.pause_button = QPushButton("Pausar")
         self.continue_button = QPushButton("Continuar")
@@ -171,21 +173,8 @@ class MainWindow(QMainWindow):
         self.packet_text_edit.append(packet_summary)
 
     def update_anomaly_display(self, anomaly_message):
-        attacker_mac = "N/A"
-        spoofed_ip = "N/A"
-
-        for line in anomaly_message.splitlines():
-            if line.startswith("Attacker MAC:"):
-                attacker_mac = line.split(":", 1)[1].strip()
-            elif line.startswith("Spoofed IP:"):
-                spoofed_ip = line.split(":", 1)[1].strip()
-
-        if attacker_mac != "N/A" and spoofed_ip != "N/A":
-            self.anomaly_label.setText("⚠ ARP Spoofing Detected")
-            self.attacker_ip_label.setText(f"Attacker MAC: {attacker_mac} | Spoofed IP: {spoofed_ip}")
-        else:
-            self.anomaly_label.setText(anomaly_message)
-            self.attacker_ip_label.setText("")
+        self.anomaly_label.setText("⚠ Network Anomaly Detected")
+        self.anomaly_text.append(anomaly_message)
 
     def update_hosts_display(self, hosts):
         self.hosts_text_edit.clear()
