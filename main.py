@@ -63,6 +63,8 @@ class AppController:
         )
 
         self.detection_engine.set_alert_callback(self.handle_alert)
+        self.detection_engine.set_capture_interface(selected_interface)
+        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
         self.window.bind_actions(
             pause_callback=self.pause_capture,
             continue_callback=self.continue_capture,
@@ -131,6 +133,9 @@ class AppController:
 
         selected_interface = self.window.get_selected_capture_interface()
         self.network_capture.interface = selected_interface
+        self.detection_engine.set_capture_interface(selected_interface)
+        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
+        self.detection_engine.build_arp_baseline()
 
         if selected_interface is None:
             QMessageBox.warning(
