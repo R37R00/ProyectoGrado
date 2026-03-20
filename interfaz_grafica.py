@@ -269,10 +269,19 @@ class MainWindow(QMainWindow):
 
     def block_selected_connection(self):
         selected_text = self.hosts_text_edit.textCursor().selectedText().strip()
+
         if "IP:" not in selected_text:
+            selected_text = self.hosts_combo_box.currentText().strip()
+
+        if "IP:" not in selected_text:
+            logging.warning("No se pudo extraer una IP válida para bloquear")
             return
 
-        attacker_ip = selected_text.split("IP: ")[-1].split(",")[0]
+        attacker_ip = selected_text.split("IP: ")[-1].split(",")[0].strip()
+        if not attacker_ip:
+            logging.warning("IP vacía al intentar bloquear host")
+            return
+
         if self._block_host_callback:
             self._block_host_callback(attacker_ip)
 
@@ -333,6 +342,8 @@ class MainWindow(QMainWindow):
                 color = QColor("#fff3cd")
             elif data["status"] == "Suspicious":
                 color = QColor("#ffcccc")
+            elif data["status"] == "Blocked":
+                color = QColor("#ff8a8a")
 
             for col in range(5):
                 item = self.hosts_table.item(row, col)

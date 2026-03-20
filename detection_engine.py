@@ -159,11 +159,19 @@ class DetectionEngine:
 
         self.capture_interface = None
         self.alert_callback = None
+        self.block_callback = None
+        self.block_whitelist = set()
 
         self.mitigation_engine = ArpMitigationEngine(self)
 
     def set_alert_callback(self, callback):
         self.alert_callback = callback
+
+    def set_block_callback(self, callback):
+        self.block_callback = callback
+
+    def set_whitelist(self, whitelist_ips):
+        self.block_whitelist = {ip for ip in (whitelist_ips or []) if ip}
 
     def set_capture_interface(self, interface):
         self.capture_interface = interface
@@ -257,6 +265,27 @@ class DetectionEngine:
                 del self.mac_table[old_mac]
 
         self.mac_table.setdefault(new_mac, set()).add(ip)
+
+    def _resolve_attacker_ip(self, attacker_mac, spoofed_ip=None, victim_ip=None):
+        if not attacker_mac:
+            return None
+
+        mac_ips = set(self.mac_table.get(attacker_mac, set()))
+        table_ips = {ip for ip, mac in self.arp_table.items() if mac == attacker_mac}
+        candidates = list(mac_ips.union(table_ips))
+        excluded = {spoofed_ip, victim_ip}
+
+        for candidate in candidates:
+            if candidate and candidate not in excluded:
+                return candidate
+
+        if victim_ip and self.arp_table.get(victim_ip) == attacker_mac:
+            return victim_ip
+
+        return None
+
+    def _is_whitelisted(self, ip_address):
+        return bool(ip_address and ip_address in self.block_whitelist)
 
     def _register_suspicious_event(self, ip):
         now = time.time()
@@ -368,6 +397,20 @@ class DetectionEngine:
         self._mark_attack_active(attack_key, confirmed=True)
         self.arp_table[sender_ip] = expected_mac
 
+        attacker_ip = self._resolve_attacker_ip(attacker_mac, spoofed_ip=sender_ip, victim_ip=target_ip)
+        if attacker_ip:
+            self.trigger_alert(f"IP atacante posible: {attacker_ip}")
+
+        if attacker_ip and self._is_whitelisted(attacker_ip):
+            logging.info("IP %s en whitelist: se omite bloqueo", attacker_ip)
+            return
+
+        if attacker_ip and self.block_callback:
+            try:
+                self.block_callback(attacker_ip)
+            except Exception as error:
+                logging.error("Error ejecutando callback de bloqueo para %s: %s", attacker_ip, error)
+
     def restore_arp(self, victim_ip, victim_mac, real_ip, real_mac):
         try:
             if not victim_ip or not real_ip or not real_mac:
@@ -412,6 +455,10 @@ class DetectionEngine:
             if not sender_ip or not sender_mac:
                 logging.debug("Paquete ARP sin campos mínimos, ignorado")
                 return
+
+            previous_mac = self.arp_table.get(sender_ip)
+            self.arp_table[sender_ip] = sender_mac
+            self._update_mac_table(sender_ip, sender_mac, previous_mac)
 
             self.detect_arp_inconsistency(sender_ip, sender_mac, target_ip, attacker_mac)
 

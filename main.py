@@ -1,5 +1,7 @@
 import logging
+import os
 import queue
+import socket
 import sys
 
 from PyQt5.QtCore import QTimer
@@ -8,6 +10,7 @@ from scapy.all import conf
 
 from detection_engine import DetectionEngine
 from interfaz_grafica import MainWindow
+from mikrotik_handler import MikrotikManager
 from network_capture import NetworkCaptureScanner
 
 
@@ -47,6 +50,7 @@ class AppController:
         self.packet_event_queue = queue.Queue()
 
         self.window.packet_text_edit.document().setMaximumBlockCount(200)
+        self.mikrotik_manager = self._build_mikrotik_manager()
 
         self.packet_flush_timer = QTimer()
         self.packet_flush_timer.setInterval(300)
@@ -63,8 +67,10 @@ class AppController:
         )
 
         self.detection_engine.set_alert_callback(self.handle_alert)
+        self.detection_engine.set_block_callback(self.block_attacker_connection)
         self.detection_engine.set_capture_interface(selected_interface)
         self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
+        self.detection_engine.set_whitelist(self._build_block_whitelist())
         self.window.bind_actions(
             pause_callback=self.pause_capture,
             continue_callback=self.continue_capture,
@@ -72,6 +78,51 @@ class AppController:
             find_hosts_callback=self.network_capture.find_hosts,
             block_host_callback=self.block_attacker_connection,
         )
+
+    def _build_mikrotik_manager(self):
+        host = os.getenv("MIKROTIK_HOST")
+        username = os.getenv("MIKROTIK_USER")
+        password = os.getenv("MIKROTIK_PASSWORD")
+        port = int(os.getenv("MIKROTIK_PORT", "8728"))
+        unblock_seconds = int(os.getenv("MIKROTIK_UNBLOCK_SECONDS", "300"))
+
+        if not host or not username or not password:
+            logging.warning("MikroTik no configurado (faltan variables de entorno)")
+            return None
+
+        manager = MikrotikManager(
+            host=host,
+            username=username,
+            password=password,
+            port=port,
+            address_list_name="blacklist",
+            default_unblock_seconds=unblock_seconds,
+        )
+        manager.connect()
+        return manager
+
+    def _build_block_whitelist(self):
+        whitelist = set()
+        router_ip = os.getenv("MIKROTIK_HOST")
+        if router_ip:
+            whitelist.add(router_ip)
+
+        try:
+            local_ip = socket.gethostbyname(socket.gethostname())
+            if local_ip:
+                whitelist.add(local_ip)
+        except Exception:
+            pass
+
+        try:
+            route = conf.route.route("0.0.0.0")
+            gateway_ip = route[2] if len(route) > 2 else None
+            if gateway_ip and gateway_ip != "0.0.0.0":
+                whitelist.add(gateway_ip)
+        except Exception:
+            pass
+
+        return whitelist
 
     def handle_packet(self, packet):
         self.window.packet_count += 1
@@ -103,7 +154,26 @@ class AppController:
         self.network_capture.stop_capture()
 
     def block_attacker_connection(self, attacker_ip):
-        print(f"Bloqueo solicitado para: {attacker_ip}")
+        if not attacker_ip:
+            return
+
+        blocked = False
+        if self.mikrotik_manager:
+            blocked = self.mikrotik_manager.block_ip(attacker_ip, attack_type="ARP Spoofing")
+        else:
+            logging.warning("Solicitud de bloqueo sin MikroTik configurado: %s", attacker_ip)
+
+        if blocked:
+            existing = self.window.hosts.get(attacker_ip, {})
+            mac = existing.get("mac", "unknown")
+            self.window.update_hosts(
+                attacker_ip,
+                mac,
+                status="Blocked",
+                host_type=existing.get("type", "Host"),
+                activity="ARP Spoofing",
+            )
+            self.window.anomaly_detected_signal.emit(f"[BLOCKED] IP bloqueada: {attacker_ip}")
 
     def ask_user_interface_if_needed(self):
         if len(self.friendly_interfaces) <= 1:
