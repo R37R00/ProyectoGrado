@@ -37,7 +37,7 @@ class MainWindow(QMainWindow):
         self.active_alerts = {}
         self.total_alerts = 0
 
-        self.setWindowTitle("Sistema de Detección de Amenazas en Redes Locales")
+        self.setWindowTitle("Sistema de Deteccion de Amenazas en Redes Locales")
         self.init_ui()
 
         self.packet_received_signal.connect(self.update_packet_display)
@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._stop_callback = None
         self._find_hosts_callback = None
         self._block_host_callback = None
+        self._unblock_host_callback = None
 
     def init_ui(self):
         main_widget = QWidget()
@@ -71,7 +72,7 @@ class MainWindow(QMainWindow):
         status_frame.setFrameShape(QFrame.StyledPanel)
         status_layout = QHBoxLayout(status_frame)
 
-        self.monitoring_status_label = QLabel("🟢 MONITORING")
+        self.monitoring_status_label = QLabel("MONITORING")
         self.interface_status_label = QLabel("Interface: N/A")
         self.host_count_status_label = QLabel("Hosts: 0")
         self.protection_status_label = QLabel("Protection: ON")
@@ -108,7 +109,7 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.anomaly_label = QLabel("⚠ Network Anomaly Detected")
+        self.anomaly_label = QLabel("Network Anomaly Detected")
         self.anomaly_text = QTextEdit()
         self.anomaly_text.setReadOnly(True)
         self.anomaly_text.document().setMaximumBlockCount(200)
@@ -141,9 +142,13 @@ class MainWindow(QMainWindow):
         self.hosts_combo_box = QComboBox()
         layout.addWidget(self.hosts_combo_box)
 
-        self.block_connection_button = QPushButton("Cortar Conexión")
+        self.block_connection_button = QPushButton("Cortar Conexion")
         self.block_connection_button.clicked.connect(self.block_selected_connection)
         layout.addWidget(self.block_connection_button)
+
+        self.unblock_connection_button = QPushButton("Permitir conexion")
+        self.unblock_connection_button.clicked.connect(self.unblock_selected_connection)
+        layout.addWidget(self.unblock_connection_button)
 
         self.find_hosts_button = QPushButton("Buscar Hosts")
         self.find_hosts_button.clicked.connect(self.find_hosts)
@@ -236,12 +241,21 @@ class MainWindow(QMainWindow):
             "aggressive_mode": self.aggressive_defense_checkbox.isChecked(),
         }
 
-    def bind_actions(self, pause_callback, continue_callback, stop_callback, find_hosts_callback, block_host_callback):
+    def bind_actions(
+        self,
+        pause_callback,
+        continue_callback,
+        stop_callback,
+        find_hosts_callback,
+        block_host_callback,
+        unblock_host_callback,
+    ):
         self._pause_callback = pause_callback
         self._continue_callback = continue_callback
         self._stop_callback = stop_callback
         self._find_hosts_callback = find_hosts_callback
         self._block_host_callback = block_host_callback
+        self._unblock_host_callback = unblock_host_callback
 
     def handle_alert(self, message):
         self.anomaly_detected_signal.emit(message)
@@ -267,23 +281,60 @@ class MainWindow(QMainWindow):
         if self._find_hosts_callback:
             self._find_hosts_callback()
 
-    def block_selected_connection(self):
+    def _parse_host_descriptor(self, text):
+        if not text:
+            return None, None
+
+        ip_address = None
+        mac_address = None
+        for segment in text.split(","):
+            segment = segment.strip()
+            if segment.startswith("IP:"):
+                ip_address = segment.split(":", 1)[1].strip()
+            elif segment.startswith("MAC:"):
+                mac_address = segment.split(":", 1)[1].strip()
+
+        return ip_address, mac_address
+
+    def _get_selected_host(self):
+        current_row = self.hosts_table.currentRow()
+        if current_row >= 0:
+            ip_item = self.hosts_table.item(current_row, 0)
+            mac_item = self.hosts_table.item(current_row, 1)
+            ip_address = ip_item.text().strip() if ip_item else None
+            mac_address = mac_item.text().strip() if mac_item else None
+            if ip_address or mac_address:
+                return ip_address, mac_address
+
         selected_text = self.hosts_text_edit.textCursor().selectedText().strip()
+        ip_address, mac_address = self._parse_host_descriptor(selected_text)
+        if ip_address or mac_address:
+            return ip_address, mac_address
 
-        if "IP:" not in selected_text:
-            selected_text = self.hosts_combo_box.currentText().strip()
+        combo_text = self.hosts_combo_box.currentText().strip()
+        return self._parse_host_descriptor(combo_text)
 
-        if "IP:" not in selected_text:
-            logging.warning("No se pudo extraer una IP válida para bloquear")
-            return
-
-        attacker_ip = selected_text.split("IP: ")[-1].split(",")[0].strip()
-        if not attacker_ip:
-            logging.warning("IP vacía al intentar bloquear host")
+    def block_selected_connection(self):
+        attacker_ip, attacker_mac = self._get_selected_host()
+        if not attacker_ip and not attacker_mac:
+            logging.warning("No se pudo extraer un host valido para bloquear")
             return
 
         if self._block_host_callback:
-            self._block_host_callback(attacker_ip)
+            self._block_host_callback(attacker_ip, attacker_mac)
+
+    def unblock_selected_connection(self):
+        attacker_ip, attacker_mac = self._get_selected_host()
+        if not attacker_ip and not attacker_mac:
+            logging.warning("No se pudo extraer un host valido para desbloquear")
+            return
+
+        if self._unblock_host_callback:
+            self._unblock_host_callback(attacker_ip, attacker_mac)
+
+    def get_mac_for_ip(self, ip_address):
+        data = self.hosts.get(ip_address, {})
+        return data.get("mac")
 
     def update_packet_display(self, packet_summary):
         self.packet_text_edit.append(packet_summary)
@@ -316,7 +367,9 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setTabText(1, f"Alerts ({self.total_alerts})")
         self.last_alert_label.setText(f"Last alert: {alert_type} | {attacker} -> {victim}")
-        self.current_status_label.setText("Current status: Attack detected" if severity == "HIGH" else "Current status: Monitoring")
+        self.current_status_label.setText(
+            "Current status: Attack detected" if severity == "HIGH" else "Current status: Monitoring"
+        )
         self.threat_level_label.setText(f"Threat level: {severity}")
         self.anomaly_text.append(raw_message)
 
@@ -355,7 +408,7 @@ class MainWindow(QMainWindow):
 
     def update_status(self, monitoring_on=None, interface=None, host_count=None, protection_on=None):
         if monitoring_on is not None:
-            self.monitoring_status_label.setText("🟢 MONITORING" if monitoring_on else "🔴 STOPPED")
+            self.monitoring_status_label.setText("MONITORING" if monitoring_on else "STOPPED")
         if interface is not None:
             self.interface_status_label.setText(f"Interface: {interface}")
         if host_count is not None:
@@ -364,7 +417,7 @@ class MainWindow(QMainWindow):
             self.protection_status_label.setText("Protection: ON" if protection_on else "Protection: OFF")
 
     def update_anomaly_display(self, anomaly_message):
-        self.anomaly_label.setText("⚠ Network Anomaly Detected")
+        self.anomaly_label.setText("Network Anomaly Detected")
 
         lines = anomaly_message.splitlines()
         alert_type = "Anomaly"
@@ -374,14 +427,25 @@ class MainWindow(QMainWindow):
         severity = "LOW"
 
         if lines:
-            if "ARP" in lines[0]:
+            first_line = lines[0]
+            if "ARP" in first_line:
                 alert_type = "ARP Spoofing"
                 severity = "HIGH"
+            elif "[BLOCKED]" in first_line:
+                alert_type = "Blocked"
+                status = "Blocked"
+                severity = "HIGH"
+            elif "[UNBLOCKED]" in first_line:
+                alert_type = "Unblocked"
+                status = "Allowed"
+
             if "MITIGATION" in anomaly_message:
                 status = "Mitigated"
 
         for line in lines:
             if line.startswith("Attacker MAC:"):
+                attacker = line.split(":", 1)[1].strip()
+            elif line.startswith("Attacker IP:"):
                 attacker = line.split(":", 1)[1].strip()
             elif line.startswith("Victim IP:"):
                 victim = line.split(":", 1)[1].strip()
@@ -392,7 +456,7 @@ class MainWindow(QMainWindow):
 
         self.add_alert(alert_type, attacker, victim, status, anomaly_message, severity=severity)
 
-        if attacker != "Unknown":
+        if alert_type == "ARP Spoofing" and attacker != "Unknown":
             self.update_hosts(attacker, "unknown", status="Suspicious", host_type="Host", activity=alert_type)
         if victim != "Unknown" and victim in self.hosts:
             data = self.hosts[victim]
@@ -403,10 +467,17 @@ class MainWindow(QMainWindow):
         self.hosts_combo_box.clear()
 
         for host in hosts:
-            ip = host["ip"]
-            mac = host["mac"]
-            self.update_hosts(ip, mac, status="Trusted", host_type="Host", activity="Normal")
+            ip_address = host["ip"]
+            mac_address = host["mac"]
+            existing = self.hosts.get(ip_address, {})
+            self.update_hosts(
+                ip_address,
+                mac_address,
+                status=existing.get("status", "Trusted"),
+                host_type=existing.get("type", "Host"),
+                activity=existing.get("activity", "Normal"),
+            )
 
-            text = f"IP: {ip}, MAC: {mac}"
+            text = f"IP: {ip_address}, MAC: {mac_address}"
             self.hosts_text_edit.append(text)
             self.hosts_combo_box.addItem(text)

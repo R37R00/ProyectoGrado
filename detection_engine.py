@@ -7,7 +7,10 @@ import threading
 import time
 
 from scapy.all import ARP, Ether, send, srp
-from scapy.layers.inet import IP, ICMP, TCP
+from scapy.layers.inet import ICMP, IP, TCP
+
+
+DEBUG = True
 
 
 class ArpMitigationEngine:
@@ -138,7 +141,7 @@ class ArpMitigationEngine:
                 subprocess.run(cmd, check=False, capture_output=True, text=True)
 
         except Exception as error:
-            logging.error("Error al fijar entrada ARP estática: %s", error)
+            logging.error("Error al fijar entrada ARP estatica: %s", error)
 
 
 class DetectionEngine:
@@ -161,6 +164,7 @@ class DetectionEngine:
         self.alert_callback = None
         self.block_callback = None
         self.block_whitelist = set()
+        self.block_mac_whitelist = set()
 
         self.mitigation_engine = ArpMitigationEngine(self)
 
@@ -173,6 +177,13 @@ class DetectionEngine:
     def set_whitelist(self, whitelist_ips):
         self.block_whitelist = {ip for ip in (whitelist_ips or []) if ip}
 
+    def set_mac_whitelist(self, whitelist_macs):
+        self.block_mac_whitelist = {
+            self._normalize_mac(mac)
+            for mac in (whitelist_macs or [])
+            if self._normalize_mac(mac)
+        }
+
     def set_capture_interface(self, interface):
         self.capture_interface = interface
 
@@ -183,6 +194,22 @@ class DetectionEngine:
             lock_gateway_enabled=lock_gateway_enabled,
             aggressive_mode=aggressive_mode,
         )
+
+    def _normalize_mac(self, mac_address):
+        if mac_address is None:
+            return None
+        value = str(mac_address).strip().lower()
+        return value or None
+
+    def get_candidate_ips_for_mac(self, mac_address):
+        normalized_mac = self._normalize_mac(mac_address)
+        if not normalized_mac:
+            return []
+
+        candidates = set(self.mac_table.get(normalized_mac, set()))
+        candidates.update(ip for ip, mac in self.arp_table.items() if self._normalize_mac(mac) == normalized_mac)
+        candidates.update(ip for ip, mac in self.arp_baseline.items() if self._normalize_mac(mac) == normalized_mac)
+        return [candidate for candidate in candidates if candidate]
 
     def build_arp_baseline(self, network_cidr=None):
         try:
@@ -203,12 +230,15 @@ class DetectionEngine:
             self.arp_baseline.clear()
             for _sent, received in answered:
                 ip = received.psrc
-                mac = received.hwsrc
+                mac = self._normalize_mac(received.hwsrc)
                 self.arp_baseline[ip] = mac
                 self.arp_table[ip] = mac
                 self._update_mac_table(ip, mac)
 
             logging.info("Baseline ARP construida con %s hosts", len(self.arp_baseline))
+            if DEBUG:
+                for ip, mac in sorted(self.arp_baseline.items()):
+                    logging.info("[DEBUG] Baseline host -> IP: %s, MAC: %s", ip, mac)
 
         except Exception as error:
             logging.error("Error construyendo baseline ARP: %s", error)
@@ -244,35 +274,38 @@ class DetectionEngine:
             if not answered:
                 return False, None
 
-            verified_mac = answered[0][1][ARP].hwsrc
+            verified_mac = self._normalize_mac(answered[0][1][ARP].hwsrc)
             logging.debug(
-                "Verificación host %s: esperado=%s verificado=%s",
+                "Verificacion host %s: esperado=%s verificado=%s",
                 ip,
                 expected_mac,
                 verified_mac,
             )
-            return verified_mac.lower() == expected_mac.lower(), verified_mac
+            return verified_mac == self._normalize_mac(expected_mac), verified_mac
 
         except Exception as error:
             logging.error("Error en verify_host para %s: %s", ip, error)
             return False, None
 
     def _update_mac_table(self, ip, new_mac, old_mac=None):
+        new_mac = self._normalize_mac(new_mac)
+        old_mac = self._normalize_mac(old_mac)
+
         if old_mac:
             previous_ips = self.mac_table.get(old_mac, set())
             previous_ips.discard(ip)
             if not previous_ips and old_mac in self.mac_table:
                 del self.mac_table[old_mac]
 
-        self.mac_table.setdefault(new_mac, set()).add(ip)
+        if new_mac:
+            self.mac_table.setdefault(new_mac, set()).add(ip)
 
     def _resolve_attacker_ip(self, attacker_mac, spoofed_ip=None, victim_ip=None):
+        attacker_mac = self._normalize_mac(attacker_mac)
         if not attacker_mac:
             return None
 
-        mac_ips = set(self.mac_table.get(attacker_mac, set()))
-        table_ips = {ip for ip, mac in self.arp_table.items() if mac == attacker_mac}
-        candidates = list(mac_ips.union(table_ips))
+        candidates = self.get_candidate_ips_for_mac(attacker_mac)
         excluded = {spoofed_ip, victim_ip}
 
         for candidate in candidates:
@@ -286,6 +319,10 @@ class DetectionEngine:
 
     def _is_whitelisted(self, ip_address):
         return bool(ip_address and ip_address in self.block_whitelist)
+
+    def _is_mac_whitelisted(self, mac_address):
+        normalized_mac = self._normalize_mac(mac_address)
+        return bool(normalized_mac and normalized_mac in self.block_mac_whitelist)
 
     def _register_suspicious_event(self, ip):
         now = time.time()
@@ -314,7 +351,9 @@ class DetectionEngine:
         }
 
     def detect_arp_inconsistency(self, sender_ip, sender_mac, target_ip, attacker_mac):
-        expected_mac = self.arp_baseline.get(sender_ip) or self.arp_table.get(sender_ip)
+        sender_mac = self._normalize_mac(sender_mac)
+        attacker_mac = self._normalize_mac(attacker_mac)
+        expected_mac = self._normalize_mac(self.arp_baseline.get(sender_ip) or self.arp_table.get(sender_ip))
 
         if not expected_mac:
             self.arp_baseline[sender_ip] = sender_mac
@@ -322,17 +361,17 @@ class DetectionEngine:
             self._update_mac_table(sender_ip, sender_mac)
             return
 
-        ip_mac_changed = expected_mac.lower() != sender_mac.lower()
+        ip_mac_changed = expected_mac != sender_mac
         mac_claims_multiple_ips = sender_mac in self.mac_table and sender_ip not in self.mac_table[sender_mac]
 
-        logging.debug(
-            "ARP packet observed: ip=%s mac=%s expected=%s changed=%s mac_multi_ip=%s",
-            sender_ip,
-            sender_mac,
-            expected_mac,
-            ip_mac_changed,
-            mac_claims_multiple_ips,
-        )
+        if DEBUG:
+            logging.info(
+                "[DEBUG] ARP change -> sender_ip=%s expected_mac=%s detected_mac=%s target_ip=%s",
+                sender_ip,
+                expected_mac,
+                sender_mac,
+                target_ip or "unknown",
+            )
 
         if not ip_mac_changed and not mac_claims_multiple_ips:
             self.arp_table[sender_ip] = sender_mac
@@ -366,7 +405,7 @@ class DetectionEngine:
 
         is_consistent, verified_mac = self.verify_host(sender_ip, expected_mac)
         if is_consistent:
-            logging.debug("Verificación activa descarta spoofing para %s", sender_ip)
+            logging.debug("Verificacion activa descarta spoofing para %s", sender_ip)
             return
 
         victim_ip = target_ip or "desconocido"
@@ -405,11 +444,20 @@ class DetectionEngine:
             logging.info("IP %s en whitelist: se omite bloqueo", attacker_ip)
             return
 
-        if attacker_ip and self.block_callback:
+        if self._is_mac_whitelisted(attacker_mac):
+            logging.info("MAC %s en whitelist: se omite bloqueo", attacker_mac)
+            return
+
+        if attacker_mac and self.block_callback:
             try:
-                self.block_callback(attacker_ip)
+                self.block_callback(attacker_ip, attacker_mac)
             except Exception as error:
-                logging.error("Error ejecutando callback de bloqueo para %s: %s", attacker_ip, error)
+                logging.error(
+                    "Error ejecutando callback de bloqueo para ip=%s mac=%s: %s",
+                    attacker_ip,
+                    attacker_mac,
+                    error,
+                )
 
     def restore_arp(self, victim_ip, victim_mac, real_ip, real_mac):
         try:
@@ -449,11 +497,11 @@ class DetectionEngine:
                 return
 
             sender_ip = arp_layer.psrc
-            sender_mac = arp_layer.hwsrc
+            sender_mac = self._normalize_mac(arp_layer.hwsrc)
             target_ip = arp_layer.pdst
-            attacker_mac = arp_layer.hwsrc
+            attacker_mac = sender_mac
             if not sender_ip or not sender_mac:
-                logging.debug("Paquete ARP sin campos mínimos, ignorado")
+                logging.debug("Paquete ARP sin campos minimos, ignorado")
                 return
 
             previous_mac = self.arp_table.get(sender_ip)

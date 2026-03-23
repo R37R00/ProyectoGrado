@@ -3,7 +3,10 @@ import logging
 import socket
 
 import psutil
-from scapy.all import AsyncSniffer, ARP, Ether, srp
+from scapy.all import ARP, AsyncSniffer, Ether, srp
+
+
+DEBUG = True
 
 
 class NetworkCaptureScanner:
@@ -28,12 +31,18 @@ class NetworkCaptureScanner:
                 self.sniffer.stop()
             except Exception as error:
                 logging.error("Error al detener captura: %s", error)
+
     def resume_capture(self):
         self.capture_paused = False
+
+    def pause_capture(self):
+        self.capture_paused = True
 
     def start_capture(self):
         try:
             logging.info("Iniciando captura en interfaz real: %s", self.interface)
+            if DEBUG:
+                logging.info("[DEBUG] Selected interface for capture: %s", self.interface or "default")
             self.sniffer = AsyncSniffer(
                 iface=self.interface,
                 prn=self._handle_packet,
@@ -72,17 +81,22 @@ class NetworkCaptureScanner:
         try:
             local_ip = self.get_interface_ip(self.interface)
             if not local_ip:
-                logging.error("No se encontró una IP IPv4 para la interfaz seleccionada: %s", self.interface)
+                logging.error("No se encontro una IP IPv4 para la interfaz seleccionada: %s", self.interface)
                 return
 
             network = ipaddress.IPv4Network(local_ip + "/24", strict=False)
-            logging.info(f"Interfaz seleccionada: {self.interface}")
-            logging.info(f"IP detectada: {local_ip}")
-            logging.info(f"Red escaneada: {network}")
+            logging.info("Interfaz seleccionada: %s", self.interface)
+            logging.info("IP detectada: %s", local_ip)
+            logging.info("Red escaneada: %s", network)
 
             arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network))
             result = srp(arp_request, timeout=3, verbose=False, iface=self.interface)[0]
             hosts = [{"ip": received.psrc, "mac": received.hwsrc} for _sent, received in result]
+
+            if DEBUG:
+                for host in hosts:
+                    logging.info("[DEBUG] Detected host -> IP: %s, MAC: %s", host["ip"], host["mac"])
+
             self.hosts_callback(hosts)
         except Exception as error:
             logging.error("Error al buscar hosts en la red: %s", error)

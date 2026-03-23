@@ -1,168 +1,207 @@
 import logging
 import threading
-from datetime import datetime
 
-from routeros_api import RouterOsApiPool
+import routeros_api
 
 
-class MikrotikManager:
-    """Gestor de bloqueo IP en MikroTik usando RouterOS API."""
+DEBUG = True
 
-    def __init__(
-        self,
-        host,
-        username,
-        password,
-        port=8728,
-        use_ssl=False,
-        address_list_name="blacklist",
-        default_unblock_seconds=300,
-    ):
-        self.host = host
-        self.username = username
-        self.password = password
-        self.port = port
-        self.use_ssl = use_ssl
-        self.address_list_name = address_list_name
-        self.default_unblock_seconds = default_unblock_seconds
 
-        self.pool = None
+class MikroTikManager:
+    """Connection and firewall rule manager for MikroTik via RouterOS API."""
+
+    def __init__(self, host, username, password, port=8728):
+        self.host = self._normalize_ip(host)
+        self.user = (username or "").strip() or None
+        self.password = None if password is None else str(password)
+        self.port = int(port or 8728)
+
+        self.connection = None
         self.api = None
-        self.lock = threading.Lock()
-        self.unblock_timers = {}
+        self.connected = False
+        self.lock = threading.RLock()
+        self.protected_ips = set()
+        self.protected_macs = set()
+
+    def _normalize_ip(self, ip_address):
+        if ip_address is None:
+            return None
+        value = str(ip_address).strip()
+        return value or None
+
+    def _normalize_mac(self, mac_address):
+        if mac_address is None:
+            return None
+        value = str(mac_address).strip().lower()
+        return value or None
+
+    def set_protected_hosts(self, ips=None, macs=None):
+        self.protected_ips = {self._normalize_ip(ip) for ip in (ips or []) if self._normalize_ip(ip)}
+        self.protected_macs = {self._normalize_mac(mac) for mac in (macs or []) if self._normalize_mac(mac)}
 
     def connect(self):
-        """Abre conexión con el router; reconecta si ya había sesión."""
-        self.disconnect()
-        self.pool = RouterOsApiPool(
-            host=self.host,
-            username=self.username,
-            password=self.password,
-            port=self.port,
-            use_ssl=self.use_ssl,
-            plaintext_login=True,
-        )
-        self.api = self.pool.get_api()
-        self.ensure_blacklist_drop_rule()
-
-    def disconnect(self):
-        if self.pool:
-            try:
-                self.pool.disconnect()
-            except Exception:
-                pass
-        self.pool = None
-        self.api = None
-
-    def _api(self):
-        if self.api is None:
-            self.connect()
-        return self.api
-
-    def _run_with_reconnect(self, fn):
-        """Ejecuta operación API y reintenta una vez ante error."""
-        try:
-            return fn(self._api())
-        except Exception as first_error:
-            logging.warning("Error MikroTik, reintentando conexión: %s", first_error)
-            try:
-                self.connect()
-                return fn(self._api())
-            except Exception as second_error:
-                logging.error("Fallo definitivo MikroTik: %s", second_error)
-                return None
-
-    def ensure_blacklist_drop_rule(self):
-        """Asegura regla: chain=forward src-address-list=blacklist action=drop."""
-
-        def _ensure(api):
-            rules = api.get_resource("/ip/firewall/filter")
-            current = rules.get(
-                chain="forward",
-                **{"src-address-list": self.address_list_name},
-                action="drop",
-            )
-            if current:
-                return True
-            rules.add(
-                chain="forward",
-                **{"src-address-list": self.address_list_name},
-                action="drop",
-                comment="Drop blacklist by IDS",
-            )
-            logging.info("Regla de firewall MikroTik creada para blacklist")
-            return True
-
-        return bool(self._run_with_reconnect(_ensure))
-
-    def is_ip_blocked(self, ip_address):
-        def _check(api):
-            resource = api.get_resource("/ip/firewall/address-list")
-            entries = resource.get(
-                list=self.address_list_name,
-                address=ip_address,
-            )
-            return len(entries) > 0
-
-        result = self._run_with_reconnect(_check)
-        return bool(result)
-
-    def block_ip(self, ip_address, attack_type="Unknown", unblock_seconds=None):
-        """Bloquea IP en blacklist y programa desbloqueo automático."""
-        if not ip_address:
-            return False
-
         with self.lock:
-            self.ensure_blacklist_drop_rule()
-            if self.is_ip_blocked(ip_address):
-                logging.info("IP %s ya estaba bloqueada, no se duplica", ip_address)
-                return True
-
-            def _add(api):
-                resource = api.get_resource("/ip/firewall/address-list")
-                resource.add(
-                    list=self.address_list_name,
-                    address=ip_address,
-                    comment="Blocked by IDS",
-                )
-                return True
-
-            added = self._run_with_reconnect(_add)
-            if not added:
+            if not self.host or not self.user:
+                self.connected = False
+                logging.error("[MIKROTIK] Connection failed: incomplete configuration")
                 return False
 
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logging.warning(
-                "[%s] IP bloqueada en MikroTik: %s | Tipo de ataque: %s",
-                timestamp,
-                ip_address,
-                attack_type,
-            )
+            self.disconnect()
 
-            delay = unblock_seconds if unblock_seconds is not None else self.default_unblock_seconds
-            timer = threading.Timer(delay, self.unblock_ip, args=(ip_address,))
-            timer.daemon = True
-            timer.start()
-            self.unblock_timers[ip_address] = timer
-            return True
-
-    def unblock_ip(self, ip_address):
-        """Elimina IP de blacklist."""
-        with self.lock:
-            def _remove(api):
-                resource = api.get_resource("/ip/firewall/address-list")
-                entries = resource.get(
-                    list=self.address_list_name,
-                    address=ip_address,
+            try:
+                logging.info(
+                    "[DEBUG] MikroTik config -> host=%s, user=%s, password=%s",
+                    self.host,
+                    self.user,
+                    "EMPTY" if self.password in {None, ""} else "SET",
                 )
-                for entry in entries:
-                    resource.remove(id=entry["id"])
+                logging.info("[MIKROTIK] Connecting to %s:%s", self.host, self.port)
+                self.connection = routeros_api.RouterOsApiPool(
+                    self.host,
+                    username=self.user,
+                    password=self.password if self.password is not None else "",
+                    port=self.port,
+                    plaintext_login=True,
+                )
+                self.api = self.connection.get_api()
+                self.api.get_resource("/system/identity").get()
+                self.connected = True
+                logging.info("[MIKROTIK] Connected successfully")
+                return True
+            except Exception as error:
+                self.connected = False
+                self.api = None
+                self.connection = None
+                logging.error("[MIKROTIK] Connection failed: %s", error)
+                return False
+
+    def disconnect(self):
+        if self.connection:
+            try:
+                self.connection.disconnect()
+            except Exception:
+                pass
+        self.connection = None
+        self.api = None
+        self.connected = False
+
+    def is_connected(self):
+        return hasattr(self, "connected") and self.connected is True
+
+    def _get_rule_id(self, rule):
+        return rule.get("id") or rule.get(".id")
+
+    def _run_with_retry(self, fn):
+        try:
+            if not self.is_connected() and not self.connect():
+                logging.error("MikroTik connection failed or not initialized")
+                return None
+            return fn()
+        except Exception as first_error:
+            logging.error("[MIKROTIK] Operation failed: %s", first_error)
+            self.disconnect()
+            if not self.connect():
+                logging.error("MikroTik connection failed or not initialized")
+                return None
+            try:
+                return fn()
+            except Exception as second_error:
+                logging.error("[MIKROTIK] Operation failed after retry: %s", second_error)
+                return None
+
+    def _find_existing_rules(self, firewall, ip_address):
+        existing_rules = []
+        for rule in firewall.get():
+            if rule.get("src-address") == ip_address or f"AUTO_BLOCK_{ip_address}" in rule.get("comment", ""):
+                existing_rules.append(rule)
+        return existing_rules
+
+    def _add_rule_at_top(self, firewall, chain, ip_address, comment):
+        rules = firewall.get()
+        first_rule_id = self._get_rule_id(rules[0]) if rules else None
+
+        add_params = {
+            "chain": chain,
+            "src_address": ip_address,
+            "action": "drop",
+            "comment": comment,
+        }
+
+        if DEBUG:
+            logging.info("[DEBUG] Adding MikroTik rule chain=%s ip=%s first_rule_id=%s", chain, ip_address, first_rule_id)
+
+        if first_rule_id:
+            try:
+                firewall.add(place_before=first_rule_id, **add_params)
+                return True
+            except Exception as error:
+                logging.warning(
+                    "[MIKROTIK] Could not place rule at top for %s in chain %s: %s",
+                    ip_address,
+                    chain,
+                    error,
+                )
+
+        firewall.add(**add_params)
+        return True
+
+    def block_ip(self, ip_address):
+        normalized_ip = self._normalize_ip(ip_address)
+        if not normalized_ip:
+            logging.error("[MIKROTIK] Block request missing attacker IP")
+            return False
+
+        if normalized_ip in self.protected_ips:
+            logging.warning("[MIKROTIK] Skipping protected IP: %s", normalized_ip)
+            return False
+
+        logging.info("[INFO] Blocking attacker IP: %s", normalized_ip)
+
+        def _block():
+            firewall = self.api.get_resource("/ip/firewall/filter")
+            existing_rules = self._find_existing_rules(firewall, normalized_ip)
+            if existing_rules:
+                logging.info("[MIKROTIK] Rule already exists for %s", normalized_ip)
                 return True
 
-            removed = self._run_with_reconnect(_remove)
-            if removed:
-                logging.info("IP desbloqueada automáticamente: %s", ip_address)
+            comment = f"AUTO_BLOCK_{normalized_ip}"
+            self._add_rule_at_top(firewall, "forward", normalized_ip, comment)
+            self._add_rule_at_top(firewall, "input", normalized_ip, comment)
+            return True
 
-            timer = self.unblock_timers.pop(ip_address, None)
-            if timer:
-                timer.cancel()
+        with self.lock:
+            result = self._run_with_retry(_block)
+            return bool(result)
+
+    def unblock_ip(self, ip_address):
+        normalized_ip = self._normalize_ip(ip_address)
+        if not normalized_ip:
+            return False
+
+        def _unblock():
+            firewall = self.api.get_resource("/ip/firewall/filter")
+            removed = False
+            for rule in firewall.get():
+                if f"AUTO_BLOCK_{normalized_ip}" in rule.get("comment", ""):
+                    rule_id = self._get_rule_id(rule)
+                    if rule_id:
+                        firewall.remove(id=rule_id)
+                        removed = True
+            if removed:
+                logging.info("[INFO] Unblocked IP: %s", normalized_ip)
+            return removed
+
+        with self.lock:
+            result = self._run_with_retry(_unblock)
+            return bool(result)
+
+    def block_attacker(self, ip_address, mac_address=None, attack_type="Unknown"):
+        _ = mac_address, attack_type
+        return self.block_ip(ip_address)
+
+    def unblock_attacker(self, ip_address, mac_address=None):
+        _ = mac_address
+        return self.unblock_ip(ip_address)
+
+
+MikrotikManager = MikroTikManager
