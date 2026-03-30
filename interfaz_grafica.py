@@ -4,12 +4,16 @@ from datetime import datetime
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSlider,
     QTableWidget,
@@ -47,6 +51,7 @@ class MainWindow(QMainWindow):
         self._pause_callback = None
         self._continue_callback = None
         self._stop_callback = None
+        self._start_callback = None
         self._find_hosts_callback = None
         self._block_host_callback = None
         self._unblock_host_callback = None
@@ -179,8 +184,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
 
         self.capture_interface_label = QLabel("Interfaz de captura")
-        self.capture_interface_combo_box = QComboBox()
-        self.capture_interface_combo_box.currentIndexChanged.connect(self.on_interface_selected)
+        self.capture_interface_list_widget = QListWidget()
+        self.capture_interface_list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.capture_interface_list_widget.itemSelectionChanged.connect(self.on_interface_selected)
+        self.active_capture_label = QLabel("Capturando en: Ninguna")
 
         self.sensitivity_label = QLabel("Detection sensitivity")
         self.sensitivity_slider = QSlider(Qt.Horizontal)
@@ -188,17 +195,21 @@ class MainWindow(QMainWindow):
         self.sensitivity_slider.setMaximum(10)
         self.sensitivity_slider.setValue(5)
 
+        self.start_button = QPushButton("Iniciar captura")
         self.pause_button = QPushButton("Pausar")
         self.continue_button = QPushButton("Continuar")
         self.stop_button = QPushButton("Detener")
+        self.start_button.clicked.connect(self.start_capture)
         self.pause_button.clicked.connect(self.pause_capture)
         self.continue_button.clicked.connect(self.continue_capture)
         self.stop_button.clicked.connect(self.stop_capture)
 
         layout.addWidget(self.capture_interface_label)
-        layout.addWidget(self.capture_interface_combo_box)
+        layout.addWidget(self.capture_interface_list_widget)
+        layout.addWidget(self.active_capture_label)
         layout.addWidget(self.sensitivity_label)
         layout.addWidget(self.sensitivity_slider)
+        layout.addWidget(self.start_button)
         layout.addWidget(self.pause_button)
         layout.addWidget(self.continue_button)
         layout.addWidget(self.stop_button)
@@ -207,31 +218,72 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(tab, "Settings")
 
     def set_capture_interfaces(self, interfaces):
-        self.capture_interface_combo_box.clear()
+        self.capture_interface_list_widget.clear()
         for friendly_name, real_name in interfaces:
-            self.capture_interface_combo_box.addItem(friendly_name, real_name)
-        self.update_status(interface=self.capture_interface_combo_box.currentText())
+            item = QListWidgetItem(friendly_name)
+            item.setData(Qt.UserRole, real_name)
+            self.capture_interface_list_widget.addItem(item)
+
+        if self.capture_interface_list_widget.count() == 1:
+            self.capture_interface_list_widget.item(0).setSelected(True)
+
+        selected = self.get_selected_capture_interfaces()
+        interface_text = ", ".join(selected) if selected else "N/A"
+        self.update_status(interface=interface_text)
 
     def on_interface_selected(self):
-        visible_name = self.capture_interface_combo_box.currentText()
-        real_identifier = self.capture_interface_combo_box.currentData()
+        visible_names = self._get_selected_interface_display_names()
+        real_identifiers = self.get_selected_capture_interfaces()
         logging.debug(
-            "Interfaz seleccionada por usuario -> visible='%s' real='%s'",
-            visible_name,
-            real_identifier,
+            "Interfaces seleccionadas por usuario -> visible=%s real=%s",
+            visible_names,
+            real_identifiers,
         )
-        self.update_status(interface=visible_name)
+        self.update_status(interface=", ".join(visible_names) if visible_names else "N/A")
+
+    def get_selected_capture_interfaces(self):
+        return [
+            item.data(Qt.UserRole)
+            for item in self.capture_interface_list_widget.selectedItems()
+            if item.data(Qt.UserRole)
+        ]
+
+    def _get_selected_interface_display_names(self):
+        return [item.text() for item in self.capture_interface_list_widget.selectedItems()]
 
     def get_selected_capture_interface(self):
-        if self.capture_interface_combo_box.count() == 0:
-            return None
-        return self.capture_interface_combo_box.currentData()
+        selected_interfaces = self.get_selected_capture_interfaces()
+        return selected_interfaces[0] if selected_interfaces else None
+
+    def set_selected_capture_interfaces(self, real_names):
+        selected_values = set(real_names or [])
+        for index in range(self.capture_interface_list_widget.count()):
+            item = self.capture_interface_list_widget.item(index)
+            item.setSelected(item.data(Qt.UserRole) in selected_values)
 
     def set_selected_capture_interface(self, real_name):
-        for index in range(self.capture_interface_combo_box.count()):
-            if self.capture_interface_combo_box.itemData(index) == real_name:
-                self.capture_interface_combo_box.setCurrentIndex(index)
-                return
+        if real_name:
+            self.set_selected_capture_interfaces([real_name])
+
+    def update_active_capture_interfaces(self, interfaces):
+        if not interfaces:
+            self.active_capture_label.setText("Capturando en: Ninguna")
+            return
+
+        labels = []
+        for interface_name in interfaces[:2]:
+            label = str(interface_name)
+            for index in range(self.capture_interface_list_widget.count()):
+                item = self.capture_interface_list_widget.item(index)
+                if item.data(Qt.UserRole) == interface_name:
+                    label = item.text()
+                    break
+            labels.append(label)
+
+        if len(labels) == 1:
+            self.active_capture_label.setText(f"Capturando en: {labels[0]}")
+        else:
+            self.active_capture_label.setText(f"Capturando en: {labels[0]} y {labels[1]}")
 
     def get_mitigation_options(self):
         return {
@@ -243,6 +295,7 @@ class MainWindow(QMainWindow):
 
     def bind_actions(
         self,
+        start_callback,
         pause_callback,
         continue_callback,
         stop_callback,
@@ -250,6 +303,7 @@ class MainWindow(QMainWindow):
         block_host_callback,
         unblock_host_callback,
     ):
+        self._start_callback = start_callback
         self._pause_callback = pause_callback
         self._continue_callback = continue_callback
         self._stop_callback = stop_callback
@@ -266,6 +320,29 @@ class MainWindow(QMainWindow):
         if self._pause_callback:
             self._pause_callback()
 
+    def start_capture(self):
+        selected_interfaces = self.get_selected_capture_interfaces()
+        if not selected_interfaces:
+            QMessageBox.warning(self, "Interfaces", "Debes seleccionar al menos una interfaz.")
+            return
+
+        if len(selected_interfaces) > 2:
+            QMessageBox.warning(self, "Interfaces", "Solo puedes seleccionar hasta dos interfaces.")
+            return
+
+        started = True
+        if self._start_callback:
+            started = bool(self._start_callback(selected_interfaces))
+
+        if not started:
+            self.update_status(monitoring_on=False)
+            self.update_active_capture_interfaces([])
+            return
+
+        self.capture_paused = False
+        self.update_status(monitoring_on=True)
+        self.update_active_capture_interfaces(selected_interfaces)
+
     def continue_capture(self):
         self.capture_paused = False
         self.update_status(monitoring_on=True)
@@ -274,6 +351,7 @@ class MainWindow(QMainWindow):
 
     def stop_capture(self):
         self.update_status(monitoring_on=False)
+        self.update_active_capture_interfaces([])
         if self._stop_callback:
             self._stop_callback()
 

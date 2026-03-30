@@ -5,11 +5,12 @@ import sys
 from datetime import datetime
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
+from PyQt5.QtWidgets import QApplication
 from scapy.all import conf, get_if_hwaddr, getmacbyip
 
 from detection_engine import DEBUG as DETECTION_DEBUG
 from detection_engine import DetectionEngine
+from event_logger import log_debug, log_event, set_gui_event_callback
 from interfaz_grafica import MainWindow
 from mikrotik_config import get_active_mikrotik_config, resolve_mikrotik_config
 from mikrotik_handler import MikroTikManager
@@ -62,8 +63,10 @@ class AppController:
         self.mikrotik_ip = None
         self.mikrotik_config = get_active_mikrotik_config()
         self.mikrotik = None
+        self.blocked_macs = set()
 
         self.window.packet_text_edit.document().setMaximumBlockCount(200)
+        set_gui_event_callback(self.handle_alert)
 
         self.packet_flush_timer = QTimer()
         self.packet_flush_timer.setInterval(300)
@@ -72,7 +75,8 @@ class AppController:
         self.friendly_interfaces = get_friendly_interfaces()
         self.window.set_capture_interfaces(self.friendly_interfaces)
 
-        selected_interface = self.window.get_selected_capture_interface()
+        selected_interfaces = self.window.get_selected_capture_interfaces()
+        selected_interface = selected_interfaces[0] if selected_interfaces else None
         self.network_capture = NetworkCaptureScanner(
             packet_callback=self.handle_packet,
             hosts_callback=self.window.hosts_found_signal.emit,
@@ -85,13 +89,19 @@ class AppController:
         self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
 
         self.window.bind_actions(
+            start_callback=self.start_capture,
             pause_callback=self.pause_capture,
             continue_callback=self.continue_capture,
             stop_callback=self.stop_capture,
-            find_hosts_callback=self.network_capture.find_hosts,
+            find_hosts_callback=self.find_hosts,
             block_host_callback=self.block_attacker_connection,
             unblock_host_callback=self.unblock_attacker_connection,
         )
+
+    def _get_primary_interface(self, selected_interfaces=None):
+        if selected_interfaces:
+            return selected_interfaces[0]
+        return self.window.get_selected_capture_interface()
 
     def _initialize_mikrotik(self, selected_interface):
         config = resolve_mikrotik_config(selected_interface=selected_interface, parent=self.window)
@@ -213,10 +223,10 @@ class AppController:
         )
 
         if DEBUG:
-            logging.info("[DEBUG] Selected interface: %s", selected_interface or "default")
-            logging.info("[DEBUG] Gateway: %s", self.gateway_ip or "unknown")
-            logging.info("[DEBUG] Own host IP: %s", self.own_host_ip or "unknown")
-            logging.info("[DEBUG] MikroTik IP: %s", self.mikrotik_ip or "unknown")
+            log_debug(f"Selected interface: {selected_interface or 'default'}")
+            log_debug(f"Gateway: {self.gateway_ip or 'unknown'}")
+            log_debug(f"Own host IP: {self.own_host_ip or 'unknown'}")
+            log_debug(f"MikroTik IP: {self.mikrotik_ip or 'unknown'}")
 
     def _candidate_ips_for_mac(self, mac_address):
         normalized_mac = self._normalize_mac(mac_address)
@@ -271,11 +281,7 @@ class AppController:
         candidates.extend(self._candidate_ips_for_mac(normalized_mac))
 
         if DEBUG or DETECTION_DEBUG:
-            logging.info(
-                "[DEBUG] Attacker candidates for mac=%s -> %s",
-                normalized_mac or "unknown",
-                candidates,
-            )
+            log_debug(f"Attacker candidates for mac={normalized_mac or 'unknown'} -> {candidates}")
 
         for candidate_ip in candidates:
             if self.is_valid_attacker(candidate_ip, normalized_mac):
@@ -301,6 +307,31 @@ class AppController:
     def handle_alert(self, message):
         self.window.anomaly_detected_signal.emit(message)
 
+    def start_capture(self, selected_interfaces):
+        if not selected_interfaces:
+            logging.error("No hay interfaces seleccionadas para iniciar la captura")
+            return False
+
+        if len(selected_interfaces) > 2:
+            logging.error("La captura dual admite como maximo dos interfaces")
+            return False
+
+        primary_interface = self._get_primary_interface(selected_interfaces)
+        self.network_capture.set_interfaces(selected_interfaces)
+        self.detection_engine.set_capture_interface(primary_interface)
+        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
+
+        self._initialize_mikrotik(primary_interface)
+        self._refresh_protection_lists(primary_interface)
+        self.detection_engine.build_arp_baseline()
+
+        started = self.network_capture.start_capture_thread(selected_interfaces)
+        if started:
+            logging.info("Captura iniciada en interfaces: %s", ", ".join(selected_interfaces))
+        else:
+            logging.error("No se pudo iniciar la captura en las interfaces seleccionadas")
+        return started
+
     def pause_capture(self):
         self.network_capture.pause_capture()
 
@@ -310,28 +341,48 @@ class AppController:
     def stop_capture(self):
         self.network_capture.stop_capture()
 
+    def find_hosts(self):
+        selected_interfaces = self.window.get_selected_capture_interfaces()
+        if selected_interfaces:
+            self.network_capture.set_interfaces(selected_interfaces)
+        self.network_capture.find_hosts()
+
     def block_attacker_connection(self, attacker_ip, attacker_mac=None, attack_type="ARP Spoofing"):
         resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
-        logging.info(
-            "[DETECTION] Attacker detected -> IP: %s, MAC: %s",
-            resolved_ip or attacker_ip or "unknown",
-            resolved_mac or "unknown",
+        log_event(
+            f"Attacker detected -> IP: {resolved_ip or attacker_ip or 'unknown'}, "
+            f"MAC: {resolved_mac or 'unknown'}",
+            "alert",
         )
 
-        if not resolved_ip:
+        if not resolved_ip or not resolved_mac:
             logging.error("Attacker validation failed - blocking cancelled")
             return
+
+        if resolved_mac in self.blocked_macs:
+            return
+
+        log_event(f"Blocking attacker MAC: {resolved_mac}", "warning")
+        print(f"[ACTION] Blocking attacker MAC: {resolved_mac}")
 
         if self.mikrotik and not self.mikrotik.is_connected():
             self.mikrotik.connect()
 
         if self.mikrotik and self.mikrotik.is_connected():
-            blocked = self.mikrotik.block_ip(resolved_ip)
+            try:
+                blocked = self.mikrotik.block_ip(resolved_ip, resolved_mac)
+            except Exception as error:
+                print(f"[ERROR] Blocking failed: {error}")
+                logging.error("Blocking failed for %s: %s", resolved_ip, error)
+                return
         else:
+            print("[ERROR] MikroTik not connected")
             logging.error("MikroTik connection failed or not initialized")
             return
 
         if blocked:
+            self.blocked_macs.add(resolved_mac)
+            print(f"[SUCCESS] Attacker {resolved_mac} blocked")
             existing = self.window.hosts.get(resolved_ip, {})
             self.window.update_hosts(
                 resolved_ip,
@@ -366,12 +417,14 @@ class AppController:
             self.mikrotik.connect()
 
         if self.mikrotik and self.mikrotik.is_connected():
-            unblocked = self.mikrotik.unblock_ip(target_ip)
+            unblocked = self.mikrotik.unblock_ip(target_ip, resolved_mac)
         else:
             logging.error("MikroTik connection failed or not initialized")
             return
 
         if unblocked:
+            if resolved_mac:
+                self.blocked_macs.discard(resolved_mac)
             existing = self.window.hosts.get(target_ip, {})
             self.window.update_hosts(
                 target_ip,
@@ -391,50 +444,10 @@ class AppController:
                 )
             )
 
-    def ask_user_interface_if_needed(self):
-        if len(self.friendly_interfaces) <= 1:
-            return
-
-        friendly_names = [friendly for friendly, _real in self.friendly_interfaces]
-        selected_name, accepted = QInputDialog.getItem(
-            self.window,
-            "Seleccionar interfaz de red",
-            "Se detectaron multiples interfaces. Elige cual deseas usar:",
-            friendly_names,
-            editable=False,
-        )
-
-        if not accepted or not selected_name:
-            return
-
-        selected_real = next(
-            (real for friendly, real in self.friendly_interfaces if friendly == selected_name),
-            None,
-        )
-        if selected_real:
-            self.window.set_selected_capture_interface(selected_real)
-
     def run(self):
-        self.ask_user_interface_if_needed()
-
-        selected_interface = self.window.get_selected_capture_interface()
-        self.network_capture.interface = selected_interface
-        self.detection_engine.set_capture_interface(selected_interface)
         self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
-        self._initialize_mikrotik(selected_interface)
-        self._refresh_protection_lists(selected_interface)
-        self.detection_engine.build_arp_baseline()
-
-        if selected_interface is None:
-            QMessageBox.warning(
-                self.window,
-                "Interfaz de red",
-                "No se pudo determinar una interfaz de captura. Se usara la interfaz por defecto de Scapy.",
-            )
-
         self.packet_flush_timer.start()
         self.window.show()
-        self.network_capture.start_capture_thread()
 
 
 def main():

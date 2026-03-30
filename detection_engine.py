@@ -9,6 +9,8 @@ import time
 from scapy.all import ARP, Ether, send, srp
 from scapy.layers.inet import ICMP, IP, TCP
 
+from event_logger import log_debug, log_event
+
 
 DEBUG = True
 
@@ -165,6 +167,7 @@ class DetectionEngine:
         self.block_callback = None
         self.block_whitelist = set()
         self.block_mac_whitelist = set()
+        self.detected_arp_attacks = set()
 
         self.mitigation_engine = ArpMitigationEngine(self)
 
@@ -254,7 +257,7 @@ class DetectionEngine:
                     self.syn_counter += 1
 
                 if ICMP in packet and packet[ICMP].type == 8:
-                    self.trigger_alert(f"Actividad ICMP sospechosa desde {src_ip}")
+                    log_event(f"Actividad ICMP sospechosa desde {src_ip}", "warning")
 
             if packet.haslayer(ARP):
                 self.detect_arp_spoofing(packet)
@@ -317,6 +320,39 @@ class DetectionEngine:
 
         return None
 
+    def handle_arp_attack(self, attacker_ip, attacker_mac, spoofed_ip=None, victim_ip=None):
+        normalized_mac = self._normalize_mac(attacker_mac)
+        resolved_ip = attacker_ip or self._resolve_attacker_ip(
+            normalized_mac,
+            spoofed_ip=spoofed_ip,
+            victim_ip=victim_ip,
+        )
+        attack_key = (resolved_ip or spoofed_ip or "unknown", normalized_mac or "unknown")
+
+        if attack_key in self.detected_arp_attacks:
+            return
+
+        self.detected_arp_attacks.add(attack_key)
+
+        if resolved_ip and self._is_whitelisted(resolved_ip):
+            logging.info("IP %s en whitelist: se omite bloqueo", resolved_ip)
+            return
+
+        if self._is_mac_whitelisted(normalized_mac):
+            logging.info("MAC %s en whitelist: se omite bloqueo", normalized_mac)
+            return
+
+        if self.block_callback:
+            try:
+                self.block_callback(resolved_ip, normalized_mac)
+            except Exception as error:
+                logging.error(
+                    "Error ejecutando callback de bloqueo para ip=%s mac=%s: %s",
+                    resolved_ip,
+                    normalized_mac,
+                    error,
+                )
+
     def _is_whitelisted(self, ip_address):
         return bool(ip_address and ip_address in self.block_whitelist)
 
@@ -365,20 +401,15 @@ class DetectionEngine:
         mac_claims_multiple_ips = sender_mac in self.mac_table and sender_ip not in self.mac_table[sender_mac]
 
         if DEBUG:
-            logging.info(
-                "[DEBUG] ARP change -> sender_ip=%s expected_mac=%s detected_mac=%s target_ip=%s",
-                sender_ip,
-                expected_mac,
-                sender_mac,
-                target_ip or "unknown",
+            log_debug(
+                f"ARP mismatch detected: sender_ip={sender_ip} expected_mac={expected_mac} "
+                f"detected_mac={sender_mac} target_ip={target_ip or 'unknown'}"
             )
 
         if not ip_mac_changed and not mac_claims_multiple_ips:
             self.arp_table[sender_ip] = sender_mac
             self._update_mac_table(sender_ip, sender_mac)
             return
-
-        logging.warning("ARP inconsistency detected for %s", sender_ip)
 
         attack_key = f"{sender_ip}-{attacker_mac}"
         suspicion_count = self._register_suspicious_event(sender_ip)
@@ -505,8 +536,20 @@ class DetectionEngine:
                 return
 
             previous_mac = self.arp_table.get(sender_ip)
+
+            if previous_mac and self._normalize_mac(previous_mac) != sender_mac:
+                log_debug(
+                    f"ARP mismatch detected: {sender_ip} changed MAC "
+                    f"{self._normalize_mac(previous_mac)} -> {sender_mac}"
+                )
+                log_event(f"ARP spoofing detected for {sender_ip}", "alert")
+
             self.arp_table[sender_ip] = sender_mac
             self._update_mac_table(sender_ip, sender_mac, previous_mac)
+
+            if previous_mac and self._normalize_mac(previous_mac) != sender_mac:
+                attacker_ip = self._resolve_attacker_ip(attacker_mac, spoofed_ip=sender_ip, victim_ip=target_ip)
+                self.handle_arp_attack(attacker_ip, attacker_mac, spoofed_ip=sender_ip, victim_ip=target_ip)
 
             self.detect_arp_inconsistency(sender_ip, sender_mac, target_ip, attacker_mac)
 
@@ -528,3 +571,5 @@ class DetectionEngine:
     def trigger_alert(self, message):
         if self.alert_callback:
             self.alert_callback(message)
+        else:
+            log_event(message, "alert")
