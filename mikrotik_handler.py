@@ -22,6 +22,7 @@ class MikroTikManager:
         self.lock = threading.RLock()
         self.protected_ips = set()
         self.protected_macs = set()
+        self.blocked_rules = {}
 
     def _normalize_ip(self, ip_address):
         if ip_address is None:
@@ -109,54 +110,46 @@ class MikroTikManager:
                 logging.error("[MIKROTIK] Operation failed after retry: %s", second_error)
                 return None
 
-    def _find_existing_rules(self, firewall, ip_address):
-        existing_rules = []
-        for rule in firewall.get():
-            if rule.get("src-address") == ip_address or f"AUTO_BLOCK_{ip_address}" in rule.get("comment", ""):
-                existing_rules.append(rule)
-        return existing_rules
+    def _tracked_comments_for_ip(self, ip_address):
+        return [
+            f"AUTO_BLOCK_{ip_address}_SRC",
+            f"AUTO_BLOCK_{ip_address}_DST",
+            f"AUTO_BLOCK_{ip_address}_INPUT",
+        ]
 
-    def _find_existing_mac_rules(self, firewall, mac_address):
-        existing_rules = []
-        for rule in firewall.get():
-            comment = rule.get("comment", "")
-            if (
-                rule.get("src-mac-address") == mac_address
-                or rule.get("dst-mac-address") == mac_address
-                or f"AUTO_BLOCK_MAC_{mac_address}" in comment
-                or f"AUTO_BLOCK_MAC_DST_{mac_address}" in comment
-            ):
-                existing_rules.append(rule)
-        return existing_rules
+    def _find_rule_by_comment(self, resource, comment):
+        for rule in resource.get():
+            if rule.get("comment", "") == comment:
+                return rule
+        return None
 
-    def _add_rule_at_top(self, firewall, chain, ip_address, comment):
-        rules = firewall.get()
+    def _extract_added_rule_id(self, add_result):
+        if isinstance(add_result, str):
+            return add_result
+        if isinstance(add_result, dict):
+            return self._get_rule_id(add_result)
+        if isinstance(add_result, (list, tuple)) and add_result:
+            first_item = add_result[0]
+            if isinstance(first_item, dict):
+                return self._get_rule_id(first_item)
+            if isinstance(first_item, str):
+                return first_item
+        return None
+
+    def _add_rule_at_top(self, resource, params, rule_label):
+        rules = resource.get()
         first_rule_id = self._get_rule_id(rules[0]) if rules else None
 
-        add_params = {
-            "chain": chain,
-            "src_address": ip_address,
-            "action": "drop",
-            "comment": comment,
-        }
-
         if DEBUG:
-            logging.info("[DEBUG] Adding MikroTik rule chain=%s ip=%s first_rule_id=%s", chain, ip_address, first_rule_id)
+            logging.info("[DEBUG] Adding MikroTik rule %s first_rule_id=%s params=%s", rule_label, first_rule_id, params)
 
         if first_rule_id:
             try:
-                firewall.add(place_before=first_rule_id, **add_params)
-                return True
+                return resource.add(**params, **{"place-before": first_rule_id})
             except Exception as error:
-                logging.warning(
-                    "[MIKROTIK] Could not place rule at top for %s in chain %s: %s",
-                    ip_address,
-                    chain,
-                    error,
-                )
+                logging.warning("[MIKROTIK] Could not place %s at top: %s", rule_label, error)
 
-        firewall.add(**add_params)
-        return True
+        return resource.add(**params)
 
     def block_ip(self, ip_address, mac_address=None):
         normalized_ip = self._normalize_ip(ip_address)
@@ -165,166 +158,78 @@ class MikroTikManager:
             logging.error("[MIKROTIK] Block request missing attacker IP")
             return False
 
-        if not normalized_mac:
-            logging.error("[MIKROTIK] Block request missing attacker MAC")
-            return False
-
         if normalized_ip in self.protected_ips:
             logging.warning("[MIKROTIK] Skipping protected IP: %s", normalized_ip)
             return False
 
-        if normalized_mac in self.protected_macs:
+        if normalized_mac and normalized_mac in self.protected_macs:
             logging.warning("[MIKROTIK] Skipping protected MAC: %s", normalized_mac)
             return False
 
-        firewall_src_comment = f"AUTO_BLOCK_SRC_{normalized_ip}"
-        firewall_dst_comment = f"AUTO_BLOCK_DST_{normalized_ip}"
-        firewall_input_comment = f"AUTO_BLOCK_INPUT_{normalized_ip}"
-        bridge_src_comment = f"BRIDGE_BLOCK_SRC_{normalized_mac}"
-        bridge_dst_comment = f"BRIDGE_BLOCK_DST_{normalized_mac}"
-
-        def _rule_exists_by_comment(resource, comment):
-            for rule in resource.get():
-                if rule.get("comment", "") == comment:
-                    return True
-            return False
-
-        def _add_rule_at_top(resource, params, rule_label):
-            rules = resource.get()
-            first_rule_id = self._get_rule_id(rules[0]) if rules else None
-
-            if first_rule_id:
-                try:
-                    resource.add(**params, **{"place-before": first_rule_id})
-                    logging.info("[MIKROTIK] Added %s at top", rule_label)
-                    return True
-                except Exception as error:
-                    logging.warning(
-                        "[MIKROTIK] Could not place %s at top: %s",
-                        rule_label,
-                        error,
-                    )
-
-            resource.add(**params)
-            logging.info("[MIKROTIK] Added %s", rule_label)
-            return True
-
-        def _ensure_bridge_ip_firewall():
-            settings = self.api.get_resource("/interface/bridge/settings")
-            try:
-                current = settings.get()
-            except Exception as error:
-                logging.warning("[MIKROTIK] Could not read bridge settings: %s", error)
-                current = []
-
-            if current:
-                setting = current[0]
-                current_value = str(
-                    setting.get("use-ip-firewall")
-                    or setting.get("use_ip_firewall")
-                    or ""
-                ).lower()
-                if current_value in {"yes", "true"}:
-                    logging.info("[MIKROTIK] Bridge setting use-ip-firewall already enabled")
-                    return True
-
-                setting_id = self._get_rule_id(setting)
-                try:
-                    if setting_id:
-                        settings.set(**{"id": setting_id, "use-ip-firewall": "yes"})
-                    else:
-                        settings.set(**{"use-ip-firewall": "yes"})
-                    logging.info("[MIKROTIK] Bridge setting use-ip-firewall enabled")
-                    return True
-                except Exception as error:
-                    logging.warning("[MIKROTIK] Could not enable use-ip-firewall via settings.set: %s", error)
-
-            try:
-                settings.set(**{"use-ip-firewall": "yes"})
-                logging.info("[MIKROTIK] Bridge setting use-ip-firewall enabled")
-                return True
-            except Exception as error:
-                logging.error("[MIKROTIK] Failed to configure bridge setting use-ip-firewall=yes: %s", error)
-                return False
+        tracked_comments = self._tracked_comments_for_ip(normalized_ip)
 
         def _block():
             firewall = self.api.get_resource("/ip/firewall/filter")
-            bridge = self.api.get_resource("/interface/bridge/filter")
-
-            _ensure_bridge_ip_firewall()
-
-            if _rule_exists_by_comment(firewall, firewall_src_comment):
-                logging.info("[MIKROTIK] Firewall source rule already exists for %s", normalized_ip)
-            else:
-                _add_rule_at_top(
-                    firewall,
+            planned_rules = [
+                (
+                    tracked_comments[0],
                     {
                         "chain": "forward",
                         "src-address": normalized_ip,
                         "action": "drop",
-                        "comment": firewall_src_comment,
+                        "comment": tracked_comments[0],
                     },
                     f"firewall source rule for {normalized_ip}",
-                )
-
-            if _rule_exists_by_comment(firewall, firewall_dst_comment):
-                logging.info("[MIKROTIK] Firewall destination rule already exists for %s", normalized_ip)
-            else:
-                _add_rule_at_top(
-                    firewall,
+                ),
+                (
+                    tracked_comments[1],
                     {
                         "chain": "forward",
                         "dst-address": normalized_ip,
                         "action": "drop",
-                        "comment": firewall_dst_comment,
+                        "comment": tracked_comments[1],
                     },
                     f"firewall destination rule for {normalized_ip}",
-                )
-
-            if _rule_exists_by_comment(firewall, firewall_input_comment):
-                logging.info("[MIKROTIK] Firewall input rule already exists for %s", normalized_ip)
-            else:
-                _add_rule_at_top(
-                    firewall,
+                ),
+                (
+                    tracked_comments[2],
                     {
                         "chain": "input",
                         "src-address": normalized_ip,
                         "action": "drop",
-                        "comment": firewall_input_comment,
+                        "comment": tracked_comments[2],
                     },
                     f"firewall input rule for {normalized_ip}",
-                )
+                ),
+            ]
 
-            if _rule_exists_by_comment(bridge, bridge_src_comment):
-                logging.info("[MIKROTIK] Bridge source MAC rule already exists for %s", normalized_mac)
-            else:
-                _add_rule_at_top(
-                    bridge,
-                    {
-                        "chain": "forward",
-                        "src-mac-address": normalized_mac,
-                        "action": "drop",
-                        "comment": bridge_src_comment,
-                    },
-                    f"bridge source rule for {normalized_mac}",
-                )
+            tracked_rule_ids = []
+            for comment, params, rule_label in planned_rules:
+                existing_rule = self._find_rule_by_comment(firewall, comment)
+                if existing_rule:
+                    rule_id = self._get_rule_id(existing_rule)
+                    if rule_id:
+                        tracked_rule_ids.append(rule_id)
+                    logging.info("[MIKROTIK] %s already exists", rule_label)
+                    continue
 
-            if _rule_exists_by_comment(bridge, bridge_dst_comment):
-                logging.info("[MIKROTIK] Bridge destination MAC rule already exists for %s", normalized_mac)
-            else:
-                _add_rule_at_top(
-                    bridge,
-                    {
-                        "chain": "forward",
-                        "dst-mac-address": normalized_mac,
-                        "action": "drop",
-                        "comment": bridge_dst_comment,
-                    },
-                    f"bridge destination rule for {normalized_mac}",
-                )
+                add_result = self._add_rule_at_top(firewall, params, rule_label)
+                rule_id = self._extract_added_rule_id(add_result)
+                if not rule_id:
+                    created_rule = self._find_rule_by_comment(firewall, comment)
+                    rule_id = self._get_rule_id(created_rule) if created_rule else None
+                if rule_id:
+                    tracked_rule_ids.append(rule_id)
+                logging.info("[MIKROTIK] Added %s", rule_label)
+
+            self.blocked_rules[normalized_ip] = {
+                "ids": tracked_rule_ids,
+                "comments": tracked_comments,
+                "mac": normalized_mac,
+            }
 
             logging.info(
-                "[MIKROTIK] Attacker blocked successfully: ip=%s mac=%s",
+                "[MIKROTIK] Attacker blocked successfully with isolated IP rules: ip=%s mac=%s",
                 normalized_ip,
                 normalized_mac,
             )
@@ -342,32 +247,25 @@ class MikroTikManager:
 
         def _unblock():
             firewall = self.api.get_resource("/ip/firewall/filter")
+            tracked_state = self.blocked_rules.get(normalized_ip, {})
+            tracked_ids = set(tracked_state.get("ids", []))
+            tracked_comments = set(tracked_state.get("comments", []))
+            if normalized_ip:
+                tracked_comments.update(self._tracked_comments_for_ip(normalized_ip))
+
             removed = False
             for rule in firewall.get():
                 comment = rule.get("comment", "")
-                if (
-                    (normalized_mac and (f"AUTO_BLOCK_MAC_{normalized_mac}" in comment or f"AUTO_BLOCK_MAC_DST_{normalized_mac}" in comment))
-                    or (normalized_ip and f"AUTO_BLOCK_{normalized_ip}" in comment)
-                ):
-                    rule_id = self._get_rule_id(rule)
-                    if rule_id:
-                        firewall.remove(id=rule_id)
-                        removed = True
-
-            if normalized_mac:
-                try:
-                    bridge = self.api.get_resource("/interface/bridge/filter")
-                    for rule in bridge.get():
-                        if f"BRIDGE_BLOCK_{normalized_mac}" in rule.get("comment", ""):
-                            rule_id = self._get_rule_id(rule)
-                            if rule_id:
-                                bridge.remove(id=rule_id)
-                                removed = True
-                except Exception:
-                    pass
+                rule_id = self._get_rule_id(rule)
+                if not rule_id:
+                    continue
+                if rule_id in tracked_ids or comment in tracked_comments:
+                    firewall.remove(id=rule_id)
+                    removed = True
 
             if removed:
-                logging.info("[INFO] Unblocked MAC/IP: %s / %s", normalized_mac or "unknown", normalized_ip or "unknown")
+                logging.info("[INFO] Unblocked attacker IP: %s", normalized_ip or "unknown")
+            self.blocked_rules.pop(normalized_ip, None)
             return removed
 
         with self.lock:

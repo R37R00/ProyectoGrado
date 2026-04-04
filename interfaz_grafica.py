@@ -133,8 +133,8 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.hosts_table = QTableWidget(0, 5)
-        self.hosts_table.setHorizontalHeaderLabels(["IP", "MAC", "Status", "Type", "Activity"])
+        self.hosts_table = QTableWidget(0, 6)
+        self.hosts_table.setHorizontalHeaderLabels(["IP", "MAC", "Interface", "Status", "Type", "Activity"])
         self.hosts_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.hosts_table)
 
@@ -414,6 +414,9 @@ class MainWindow(QMainWindow):
         data = self.hosts.get(ip_address, {})
         return data.get("mac")
 
+    def get_host(self, ip_address):
+        return self.hosts.get(ip_address, {})
+
     def update_packet_display(self, packet_summary):
         self.packet_text_edit.append(packet_summary)
 
@@ -451,38 +454,72 @@ class MainWindow(QMainWindow):
         self.threat_level_label.setText(f"Threat level: {severity}")
         self.anomaly_text.append(raw_message)
 
-    def update_hosts(self, ip, mac, status="Unknown", host_type="Host", activity="Normal"):
-        self.hosts[ip] = {
-            "mac": mac,
-            "status": status,
-            "type": host_type,
-            "activity": activity,
-        }
+    def _normalize_host_status(self, status):
+        return (status or "trusted").strip().lower()
 
+    def _refresh_hosts_view(self):
         self.hosts_table.setRowCount(0)
-        for row, (host_ip, data) in enumerate(self.hosts.items()):
+        self.hosts_text_edit.clear()
+        self.hosts_combo_box.clear()
+
+        for row, host_ip in enumerate(sorted(self.hosts)):
+            data = self.hosts[host_ip]
+            interface_text = data.get("interface", "Unknown")
+            status_value = self._normalize_host_status(data.get("status"))
+            display_status = status_value.title()
+
             self.hosts_table.insertRow(row)
             self.hosts_table.setItem(row, 0, QTableWidgetItem(host_ip))
-            self.hosts_table.setItem(row, 1, QTableWidgetItem(data["mac"]))
-            self.hosts_table.setItem(row, 2, QTableWidgetItem(data["status"]))
-            self.hosts_table.setItem(row, 3, QTableWidgetItem(data["type"]))
-            self.hosts_table.setItem(row, 4, QTableWidgetItem(data["activity"]))
+            self.hosts_table.setItem(row, 1, QTableWidgetItem(data.get("mac", "unknown")))
+            self.hosts_table.setItem(row, 2, QTableWidgetItem(interface_text))
+            self.hosts_table.setItem(row, 3, QTableWidgetItem(display_status))
+            self.hosts_table.setItem(row, 4, QTableWidgetItem(data.get("type", "Host")))
+            self.hosts_table.setItem(row, 5, QTableWidgetItem(data.get("activity", "Normal")))
 
             color = QColor("#ccffcc")
-            if data["status"] == "Unknown":
+            if status_value == "unknown":
                 color = QColor("#fff3cd")
-            elif data["status"] == "Suspicious":
+            elif status_value in {"attacker", "suspicious"}:
                 color = QColor("#ffcccc")
-            elif data["status"] == "Blocked":
+            elif status_value == "blocked":
                 color = QColor("#ff8a8a")
 
-            for col in range(5):
+            for col in range(6):
                 item = self.hosts_table.item(row, col)
                 if item:
                     item.setBackground(color)
 
+            descriptor = (
+                f"IP: {host_ip}, MAC: {data.get('mac', 'unknown')}, "
+                f"IFACE: {interface_text}, STATUS: {display_status}"
+            )
+            self.hosts_text_edit.append(descriptor)
+            self.hosts_combo_box.addItem(descriptor)
+
         self.update_status(host_count=len(self.hosts))
         self.total_hosts_label.setText(f"Total hosts detected: {len(self.hosts)}")
+
+    def update_hosts(self, ip, mac, status="unknown", host_type="Host", activity="Normal", interface_name=None):
+        if not ip:
+            return
+
+        existing = self.hosts.get(ip, {})
+        interface_names = set(existing.get("interfaces", set()))
+        if interface_name:
+            for value in str(interface_name).split(","):
+                value = value.strip()
+                if value:
+                    interface_names.add(value)
+
+        self.hosts[ip] = {
+            "mac": mac or existing.get("mac", "unknown"),
+            "status": self._normalize_host_status(status or existing.get("status")),
+            "type": host_type or existing.get("type", "Host"),
+            "activity": activity or existing.get("activity", "Normal"),
+            "interfaces": interface_names,
+            "interface": ", ".join(sorted(interface_names)) if interface_names else existing.get("interface", "Unknown"),
+        }
+        self._refresh_hosts_view()
 
     def update_status(self, monitoring_on=None, interface=None, host_count=None, protection_on=None):
         if monitoring_on is not None:
@@ -535,27 +572,45 @@ class MainWindow(QMainWindow):
         self.add_alert(alert_type, attacker, victim, status, anomaly_message, severity=severity)
 
         if alert_type == "ARP Spoofing" and attacker != "Unknown":
-            self.update_hosts(attacker, "unknown", status="Suspicious", host_type="Host", activity=alert_type)
+            existing = self.hosts.get(attacker, {})
+            self.update_hosts(
+                attacker,
+                existing.get("mac", "unknown"),
+                status="attacker",
+                host_type=existing.get("type", "Host"),
+                activity=alert_type,
+                interface_name=existing.get("interface"),
+            )
         if victim != "Unknown" and victim in self.hosts:
             data = self.hosts[victim]
-            self.update_hosts(victim, data["mac"], status=data["status"], host_type=data["type"], activity=alert_type)
+            self.update_hosts(
+                victim,
+                data["mac"],
+                status=data["status"],
+                host_type=data["type"],
+                activity=alert_type,
+                interface_name=data.get("interface"),
+            )
 
     def update_hosts_display(self, hosts):
-        self.hosts_text_edit.clear()
-        self.hosts_combo_box.clear()
-
+        merged_hosts = {}
         for host in hosts:
             ip_address = host["ip"]
             mac_address = host["mac"]
-            existing = self.hosts.get(ip_address, {})
-            self.update_hosts(
-                ip_address,
-                mac_address,
-                status=existing.get("status", "Trusted"),
-                host_type=existing.get("type", "Host"),
-                activity=existing.get("activity", "Normal"),
-            )
+            interface_text = host.get("interface", "Unknown")
+            interface_names = {
+                value.strip()
+                for value in interface_text.split(",")
+                if value.strip()
+            }
+            merged_hosts[ip_address] = {
+                "mac": mac_address,
+                "status": self._normalize_host_status(host.get("status", "trusted")),
+                "type": host.get("type", "Host"),
+                "activity": host.get("activity", "Normal"),
+                "interfaces": interface_names,
+                "interface": ", ".join(sorted(interface_names)) if interface_names else "Unknown",
+            }
 
-            text = f"IP: {ip_address}, MAC: {mac_address}"
-            self.hosts_text_edit.append(text)
-            self.hosts_combo_box.addItem(text)
+        self.hosts = merged_hosts
+        self._refresh_hosts_view()
