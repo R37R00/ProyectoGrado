@@ -133,6 +133,7 @@ class AppController:
                         "status": self._normalize_status(data.get("status")),
                         "type": data.get("type", "Host"),
                         "activity": data.get("activity", "Normal"),
+                        "attack_types": sorted(data.get("attack_types", set())),
                     }
                 )
             return serialized
@@ -140,7 +141,17 @@ class AppController:
     def _emit_hosts_update(self):
         self.window.hosts_found_signal.emit(self._serialize_hosts())
 
-    def _upsert_host_record(self, ip_address, mac_address=None, interface_name=None, status=None, activity=None, host_type=None, emit=True):
+    def _upsert_host_record(
+        self,
+        ip_address,
+        mac_address=None,
+        interface_name=None,
+        status=None,
+        activity=None,
+        host_type=None,
+        attack_type=None,
+        emit=True,
+    ):
         normalized_ip = self._normalize_ip(ip_address)
         normalized_mac = self._normalize_mac(mac_address)
         if not normalized_ip:
@@ -150,11 +161,15 @@ class AppController:
         with self.host_lock:
             existing = self.host_records.get(normalized_ip, {})
             interfaces = set(existing.get("interfaces", set()))
+            attack_types = set(existing.get("attack_types", set()))
             if interface_name:
                 for value in str(interface_name).split(","):
                     value = value.strip()
                     if value:
                         interfaces.add(value)
+
+            if attack_type:
+                attack_types.add(str(attack_type).strip())
 
             updated_record = {
                 "mac": normalized_mac or existing.get("mac", "unknown"),
@@ -162,6 +177,7 @@ class AppController:
                 "type": host_type or existing.get("type", "Host"),
                 "activity": activity or existing.get("activity", "Normal"),
                 "interfaces": interfaces,
+                "attack_types": attack_types,
             }
             changed = updated_record != existing
             self.host_records[normalized_ip] = updated_record
@@ -724,98 +740,72 @@ class AppController:
             self.network_capture.set_interfaces(selected_interfaces)
         self.network_capture.find_hosts()
 
-    def block_attacker_connection(self, attacker_ip, attacker_mac=None, attack_type="ARP Spoofing"):
-        raw_attacker_ip = self._normalize_ip(attacker_ip)
-        attack_context = self.detection_engine.get_attack_context(attacker_ip, attacker_mac) or {}
-        gateway_candidate = self._normalize_ip(attack_context.get("gateway_ip") or attack_context.get("spoofed_ip"))
-        local_interface_ips = {
-            self._normalize_ip(ip_address)
-            for ip_address in self.local_interface_ips
-            if self._normalize_ip(ip_address)
-        }
-        if raw_attacker_ip and raw_attacker_ip in self.gateway_ips:
-            print("[CRITICAL] Gateway detected in spoof, skipping block")
-            logging.critical("Gateway detected as attacker candidate: %s", raw_attacker_ip)
-            return
-        if raw_attacker_ip and gateway_candidate and raw_attacker_ip == gateway_candidate:
-            print("[CRITICAL] Gateway detected in spoof, skipping block")
-            logging.critical("Gateway detected from attack context as attacker candidate: %s", raw_attacker_ip)
-            return
+    def block_attacker_connection(self, attacker_ip, attacker_mac=None, attack_type="Unknown"):
+        normalized_ip = self._normalize_ip(attacker_ip)
+        normalized_mac = self._normalize_mac(attacker_mac)
+        attack_context = self.detection_engine.get_attack_context(normalized_ip or attacker_ip, attacker_mac) or {}
 
-        resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
-        attack_context = self.detection_engine.get_attack_context(resolved_ip or attacker_ip, attacker_mac) or attack_context
-        candidate_victim_ip = self._normalize_ip(
-            attack_context.get("victim_ip")
-            or attack_context.get("target_ip")
+        log_debug(
+            f"[BLOCK FLOW] Request to block attacker={normalized_ip or attacker_ip or 'unknown'} "
+            f"mac={normalized_mac or 'unknown'} attack_type={attack_type}"
         )
-        log_event(
-            f"Attacker detected -> IP: {resolved_ip or attacker_ip or 'unknown'}, "
-            f"MAC: {resolved_mac or 'unknown'}",
-            "alert",
+        log_debug(
+            f"[ATTACK TYPE] Blocking {normalized_ip or attacker_ip or 'unknown'} as {attack_type}"
         )
 
-        if not resolved_ip or not resolved_mac:
-            logging.error("Attacker validation failed - blocking cancelled")
-            return
+        if not normalized_ip:
+            logging.error("[BLOCK] Invalid attacker IP received: %s", attacker_ip)
+            return False
 
-        if resolved_ip in self.gateway_ips:
-            print("[CRITICAL] Gateway detected in spoof, skipping block")
-            logging.critical("Gateway detected as resolved attacker: %s", resolved_ip)
-            return
-        if gateway_candidate and resolved_ip == gateway_candidate:
-            print("[CRITICAL] Gateway detected in spoof, skipping block")
-            logging.critical("Gateway detected from attack context as resolved attacker: %s", resolved_ip)
-            return
-        if resolved_ip in local_interface_ips:
-            logging.warning("Skipping block because attacker matches local interface IP: %s", resolved_ip)
-            return
-
-        if candidate_victim_ip and resolved_ip == candidate_victim_ip:
-            logging.warning("Skipping block because attacker matches victim: %s", resolved_ip)
-            return
-
-        host_record = self._get_host_record(resolved_ip)
+        host_record = self._get_host_record(normalized_ip)
         self._upsert_host_record(
-            resolved_ip,
-            resolved_mac or host_record.get("mac"),
+            normalized_ip,
+            normalized_mac or host_record.get("mac"),
             interface_name=", ".join(sorted(host_record.get("interfaces", set()))) if host_record else None,
             status="attacker",
             activity=attack_type,
+            attack_type=attack_type,
         )
 
-        if resolved_ip in self.blocked_ips or resolved_mac in self.blocked_macs:
-            return
-
-        log_event(f"Blocking attacker IP: {resolved_ip}", "warning")
-        print(f"[BLOCK] Blocking attacker: {resolved_ip}")
-
         if self.mikrotik and not self.mikrotik.is_connected():
-            self.mikrotik.connect()
-
-        if self.mikrotik and self.mikrotik.is_connected():
             try:
-                blocked = self.mikrotik.block_ip(resolved_ip, resolved_mac)
+                self.mikrotik.connect()
             except Exception as error:
-                print(f"[ERROR] Blocking failed: {error}")
-                logging.error("Blocking failed for %s: %s", resolved_ip, error)
-                return
-        else:
-            print("[ERROR] MikroTik not connected")
-            logging.error("MikroTik connection failed or not initialized")
-            return
+                logging.error("[BLOCK] Exception while connecting MikroTik for %s: %s", normalized_ip, error)
+                return False
 
-        if blocked:
-            self.blocked_ips.add(resolved_ip)
-            self.blocked_macs.add(resolved_mac)
-            print(f"[SUCCESS] Attacker {resolved_ip} blocked")
-            updated_record = self._get_host_record(resolved_ip)
+        if not self.mikrotik or not self.mikrotik.is_connected():
+            logging.error("[BLOCK] MikroTik connection failed or not initialized for %s", normalized_ip)
+            return False
+
+        try:
+            result = self.mikrotik.block_attacker(normalized_ip, normalized_mac, attack_type=attack_type)
+            log_debug(f"[BLOCK FLOW] MikroTik block result attacker={normalized_ip} result={result!r}")
+        except TypeError:
+            try:
+                result = self.mikrotik.block_attacker(normalized_ip, normalized_mac)
+                log_debug(f"[BLOCK FLOW] MikroTik block result attacker={normalized_ip} result={result!r}")
+            except Exception as error:
+                logging.error("[BLOCK] Exception while blocking %s: %s", normalized_ip, error)
+                return False
+        except Exception as error:
+            logging.error("[BLOCK] Exception while blocking %s: %s", normalized_ip, error)
+            return False
+
+        if result:
+            self.blocked_ips.add(normalized_ip)
+            if normalized_mac:
+                self.blocked_macs.add(normalized_mac)
+
+            updated_record = self._get_host_record(normalized_ip)
             self._upsert_host_record(
-                resolved_ip,
-                resolved_mac or updated_record.get("mac", "unknown"),
+                normalized_ip,
+                normalized_mac or updated_record.get("mac", "unknown"),
                 interface_name=", ".join(sorted(updated_record.get("interfaces", set()))) if updated_record else None,
                 status="blocked",
                 host_type=updated_record.get("type", "Host"),
                 activity=attack_type,
+                attack_type=attack_type,
             )
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -824,14 +814,21 @@ class AppController:
                     [
                         "[BLOCKED] Attacker blocked",
                         f"Timestamp: {timestamp}",
-                        f"Attacker IP: {resolved_ip}",
-                        f"Attacker MAC: {resolved_mac or 'unknown'}",
+                        f"Attacker IP: {normalized_ip}",
+                        f"Attacker MAC: {normalized_mac or 'unknown'}",
                         f"Attack Type: {attack_type}",
                     ]
                 )
             )
-            time.sleep(1)
-            self._restore_victim_connectivity(resolved_ip, resolved_mac)
+
+            logging.info("[BLOCK] Attacker %s blocked successfully as %s", normalized_ip, attack_type)
+            if attack_context:
+                time.sleep(1)
+                self._restore_victim_connectivity(normalized_ip, normalized_mac)
+            return True
+
+        logging.error("[BLOCK] MikroTik failed to block %s as %s", normalized_ip, attack_type)
+        return False
 
     def unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
         resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)

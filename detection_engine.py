@@ -182,7 +182,12 @@ class DetectionEngine:
         self.block_whitelist = set()
         self.block_mac_whitelist = set()
         self.local_networks = []
+        self.observed_ips = set()
         self.detected_arp_attacks = set()
+        self.port_scan_tracker = {}
+        self.port_scan_window_s = 5
+        self.port_scan_threshold = 10
+        self.detected_port_scanners = set()
         self.blocked_hosts = set()
         self.attack_contexts = {}
 
@@ -210,12 +215,69 @@ class DetectionEngine:
             if not network:
                 continue
             try:
-                self.local_networks.append(ipaddress.ip_network(str(network), strict=False))
+                normalized_network = ipaddress.ip_network(str(network), strict=False)
+                if normalized_network.version == 4:
+                    self.local_networks.append(normalized_network)
             except ValueError:
+                logging.warning("Red local invalida descartada: %s", network)
                 continue
+        logging.debug(
+            "Local networks configuradas manualmente: %s",
+            ", ".join(str(network) for network in self.local_networks) if self.local_networks else "none",
+        )
+
+    def update_local_networks(self, interfaces):
+        if interfaces is None:
+            normalized_interfaces = []
+        elif isinstance(interfaces, (list, tuple, set)):
+            normalized_interfaces = [str(interface).strip() for interface in interfaces if interface]
+        else:
+            normalized_interfaces = [str(interfaces).strip()] if interfaces else []
+
+        discovered_networks = {}
+
+        if not normalized_interfaces:
+            self.local_networks = []
+            logging.debug("update_local_networks sin interfaces validas; se activa fallback fail-open")
+            return
+
+        try:
+            from network_capture import NetworkCaptureScanner
+
+            scanner = NetworkCaptureScanner(lambda _packet: None, lambda _hosts: None)
+        except Exception as error:
+            self.local_networks = []
+            logging.error("No se pudo inicializar NetworkCaptureScanner para descubrir redes locales: %s", error)
+            return
+
+        for interface_name in normalized_interfaces:
+            try:
+                network = scanner.get_interface_network(interface_name)
+            except Exception as error:
+                logging.warning("Error obteniendo red local para interfaz %s: %s", interface_name, error)
+                continue
+
+            if not network:
+                logging.debug("No se detecto red IPv4 para interfaz %s", interface_name)
+                continue
+
+            try:
+                ipv4_network = ipaddress.IPv4Network(str(network), strict=False)
+            except ValueError:
+                logging.warning("Red local invalida descartada para interfaz %s: %s", interface_name, network)
+                continue
+
+            discovered_networks[str(ipv4_network)] = ipv4_network
+
+        self.local_networks = list(discovered_networks.values())
+        logging.debug(
+            "Local networks descubiertas dinamicamente: %s",
+            ", ".join(str(network) for network in self.local_networks) if self.local_networks else "none",
+        )
 
     def set_capture_interface(self, interface):
         self.capture_interface = interface
+        self.update_local_networks(interface)
 
     def configure_mitigation(self, mitigation_enabled, periodic_enabled, lock_gateway_enabled, aggressive_mode):
         self.mitigation_engine.configure(
@@ -282,18 +344,60 @@ class DetectionEngine:
         return len(parts) == 6 and all(len(part) == 2 for part in parts)
 
     def _is_ip_in_local_networks(self, ip_address):
-        if not ip_address:
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            logging.debug("Validacion de red local omitida: IP vacia")
             return False
 
         try:
-            candidate = ipaddress.ip_address(ip_address)
+            candidate = ipaddress.ip_address(normalized_ip)
         except ValueError:
+            logging.debug("Validacion de red local fallo: IP invalida %s", normalized_ip)
+            return False
+
+        if candidate.version != 4:
+            logging.debug("Validacion de red local omitida para IP no IPv4 %s", normalized_ip)
             return False
 
         if not self.local_networks:
-            return candidate.is_private
+            logging.debug("No hay redes locales descubiertas; fail-open habilitado para %s", normalized_ip)
+            return True
 
-        return any(candidate in network for network in self.local_networks)
+        in_local_networks = any(candidate in network for network in self.local_networks)
+        logging.debug(
+            "Evaluacion de red local ip=%s resultado=%s redes=%s",
+            normalized_ip,
+            in_local_networks,
+            ", ".join(str(network) for network in self.local_networks),
+        )
+        return in_local_networks
+
+    def _is_ip_trusted_context(self, ip):
+        normalized_ip = str(ip).strip() if ip else None
+        return bool(normalized_ip and normalized_ip in self.observed_ips)
+
+    def _is_attacker_ip_allowed(self, attacker_ip, reason):
+        normalized_ip = str(attacker_ip).strip() if attacker_ip else None
+        if not normalized_ip:
+            logging.debug("Evaluacion atacante sin IP (%s)", reason)
+            return False
+
+        if self._is_invalid_ip_candidate(normalized_ip):
+            logging.debug("Evaluacion atacante rechazada por IP invalida ip=%s reason=%s", normalized_ip, reason)
+            return False
+
+        in_local_networks = self._is_ip_in_local_networks(normalized_ip)
+        in_observed_context = self._is_ip_trusted_context(normalized_ip)
+        allowed = in_local_networks or in_observed_context
+        logging.debug(
+            "Evaluacion atacante ip=%s reason=%s local=%s observed=%s allowed=%s",
+            normalized_ip,
+            reason,
+            in_local_networks,
+            in_observed_context,
+            allowed,
+        )
+        return allowed
 
     def _observe_real_ip_source(self, packet):
         if not (packet.haslayer(IP) and packet.haslayer(Ether)):
@@ -304,7 +408,8 @@ class DetectionEngine:
         if not source_ip or not source_mac or self._is_invalid_ip_candidate(source_ip):
             return
 
-        if not self._is_ip_in_local_networks(source_ip):
+        if not self._is_attacker_ip_allowed(source_ip, "observe_real_ip_source"):
+            logging.debug("Fuente real descartada para correlacion MAC/IP: %s", source_ip)
             return
 
         self.mac_ip_map[source_mac] = source_ip
@@ -315,11 +420,10 @@ class DetectionEngine:
             return None
 
         attacker_ip = self.mac_ip_map.get(normalized_mac)
-        if (
-            not attacker_ip
-            or self._is_invalid_ip_candidate(attacker_ip)
-            or not self._is_ip_in_local_networks(attacker_ip)
-        ):
+        if not attacker_ip:
+            return None
+
+        if not self._is_attacker_ip_allowed(attacker_ip, "resolve_real_traffic"):
             return None
 
         return attacker_ip
@@ -354,8 +458,7 @@ class DetectionEngine:
                     normalized_candidate_ip
                     and normalized_candidate_ip not in excluded
                     and self._normalize_mac(candidate_mac) == normalized_mac
-                    and not self._is_invalid_ip_candidate(normalized_candidate_ip)
-                    and self._is_ip_in_local_networks(normalized_candidate_ip)
+                    and self._is_attacker_ip_allowed(normalized_candidate_ip, "resolve_context")
                 ):
                     return normalized_candidate_ip
 
@@ -417,13 +520,23 @@ class DetectionEngine:
     def process_packet(self, packet):
         try:
             if IP in packet:
-                src_ip = packet[IP].src
+                src_ip = str(packet[IP].src).strip() if packet[IP].src else None
+                dst_ip = str(packet[IP].dst).strip() if packet[IP].dst else None
+                if src_ip:
+                    self.observed_ips.add(src_ip)
                 self._observe_real_ip_source(packet)
                 self.packet_counter += 1
                 self.ip_packet_count[src_ip] = self.ip_packet_count.get(src_ip, 0) + 1
 
-                if TCP in packet and packet[TCP].flags & 0x02:
-                    self.syn_counter += 1
+                if TCP in packet:
+                    tcp_layer = packet[TCP]
+                    tcp_flags = int(tcp_layer.flags)
+
+                    if tcp_flags & 0x02:
+                        self.syn_counter += 1
+
+                        if not (tcp_flags & 0x10):
+                            self._track_port_scan(src_ip, dst_ip, tcp_layer.dport)
 
                 if ICMP in packet and packet[ICMP].type == 8:
                     log_event(f"Actividad ICMP sospechosa desde {src_ip}", "warning")
@@ -555,8 +668,8 @@ class DetectionEngine:
             logging.warning("Ataque ARP detectado pero sin IP atacante valida; se omite bloqueo automatico")
             return
 
-        if self._is_invalid_ip_candidate(resolved_ip):
-            logging.warning("IP atacante invalida detectada (%s); se omite bloqueo automatico", resolved_ip)
+        if not self._is_attacker_ip_allowed(resolved_ip, "handle_arp_attack"):
+            logging.warning("Attacker validation failed - blocking cancelled ip=%s attack=arp", resolved_ip)
             return
 
         attack_key = (resolved_ip, normalized_mac or "unknown")
@@ -590,7 +703,9 @@ class DetectionEngine:
         if self.block_callback:
             try:
                 self.blocked_hosts.add(resolved_ip)
-                self.block_callback(resolved_ip, normalized_mac)
+                if DEBUG:
+                    log_debug(f"[ATTACK TYPE] Detected ARP Spoofing from {resolved_ip}")
+                self.block_callback(resolved_ip, normalized_mac, "ARP Spoofing")
             except Exception as error:
                 self.blocked_hosts.discard(resolved_ip)
                 logging.error(
@@ -606,6 +721,171 @@ class DetectionEngine:
     def _is_mac_whitelisted(self, mac_address):
         normalized_mac = self._normalize_mac(mac_address)
         return bool(normalized_mac and normalized_mac in self.block_mac_whitelist)
+
+    def _track_port_scan(self, src_ip, dst_ip, dst_port):
+        attacker_ip = str(src_ip).strip() if src_ip else None
+        target_ip = str(dst_ip).strip() if dst_ip else None
+
+        if not attacker_ip or not target_ip or dst_port is None:
+            return
+
+        if self._is_invalid_ip_candidate(attacker_ip):
+            return
+
+        tracker_key = (attacker_ip, target_ip)
+        if tracker_key in self.detected_port_scanners:
+            return
+
+        now = time.time()
+        cutoff = now - self.port_scan_window_s
+        recent_entries = [
+            (port, timestamp)
+            for port, timestamp in self.port_scan_tracker.get(tracker_key, [])
+            if timestamp >= cutoff
+        ]
+
+        recent_entries.append((int(dst_port), now))
+        self.port_scan_tracker[tracker_key] = recent_entries
+
+        unique_ports = {port for port, _timestamp in recent_entries}
+        if len(unique_ports) < self.port_scan_threshold:
+            return
+
+        logging.warning(
+            "Posible port scan TCP SYN detectado src=%s dst=%s puertos_unicos=%s ventana=%ss",
+            attacker_ip,
+            target_ip,
+            len(unique_ports),
+            self.port_scan_window_s,
+        )
+        self._handle_port_scan(attacker_ip, target_ip, unique_ports)
+
+    def _log_port_scan_debug(self, message):
+        logging.debug(message)
+        if DEBUG:
+            log_debug(message)
+
+    def _handle_port_scan(self, attacker_ip, target_ip, ports):
+        attacker_ip = str(attacker_ip).strip() if attacker_ip else None
+        target_ip = str(target_ip).strip() if target_ip else None
+        detection_key = (attacker_ip, target_ip)
+        sorted_ports = sorted({int(port) for port in ports if port is not None})
+
+        self._log_port_scan_debug(
+            f"[PORT SCAN] Handle start attacker={attacker_ip or 'unknown'} "
+            f"target={target_ip or 'unknown'} ports={sorted_ports}"
+        )
+
+        if detection_key in self.detected_port_scanners:
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Already blocked, skipping attacker={attacker_ip or 'unknown'} "
+                f"target={target_ip or 'unknown'}"
+            )
+            logging.info("Port scan ya procesado para attacker=%s target=%s", attacker_ip, target_ip)
+            return
+
+        if not attacker_ip:
+            self._log_port_scan_debug("[PORT SCAN] Skipping block reason=missing_attacker_ip")
+            logging.info("IP atacante invalida para port scan (%s); se omite bloqueo", attacker_ip)
+            return
+
+        if not self._is_attacker_ip_allowed(attacker_ip, "handle_port_scan"):
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=attacker_validation_failed attacker={attacker_ip}"
+            )
+            logging.warning("Attacker validation failed - blocking cancelled ip=%s attack=port_scan", attacker_ip)
+            return
+
+        if self._is_whitelisted(attacker_ip):
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=whitelisted attacker={attacker_ip}"
+            )
+            logging.info("IP %s en whitelist: se omite bloqueo por port scan", attacker_ip)
+            return
+
+        if attacker_ip in self.blocked_hosts:
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=already_blocked attacker={attacker_ip}"
+            )
+            logging.info("IP %s ya fue bloqueada previamente; se omite bloqueo por port scan", attacker_ip)
+            self.detected_port_scanners.add(detection_key)
+            self.port_scan_tracker.pop(detection_key, None)
+            return
+
+        port_preview = ", ".join(str(port) for port in sorted_ports[:10])
+        if len(sorted_ports) > 10:
+            port_preview += ", ..."
+
+        message = (
+            "[ALERT] TCP SYN Port Scan Detected\n"
+            f"Attacker IP: {attacker_ip}\n"
+            f"Target IP: {target_ip or 'unknown'}\n"
+            f"Unique Ports: {len(sorted_ports)}\n"
+            f"Observed Ports: {port_preview}\n"
+            f"Window: {self.port_scan_window_s}s"
+        )
+
+        logging.warning(
+            "Port scan confirmado src=%s dst=%s ports=%s",
+            attacker_ip,
+            target_ip,
+            sorted_ports,
+        )
+        self.trigger_alert(message)
+
+        if not self.block_callback:
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=missing_block_callback attacker={attacker_ip}"
+            )
+            logging.critical("block_callback not defined attacker=%s", attacker_ip)
+            return
+
+        self._log_port_scan_debug(
+            f"[PORT SCAN] Attempting block attacker={attacker_ip} target={target_ip or 'unknown'} "
+            f"ports={sorted_ports}"
+        )
+        logging.info("Attempting to block attacker %s por port scan", attacker_ip)
+
+        try:
+            if DEBUG:
+                log_debug(f"[ATTACK TYPE] Detected Port Scan from {attacker_ip}")
+            result = self.block_callback(attacker_ip, None, "Port Scan")
+            self._log_port_scan_debug(
+                f"[PORT SCAN] block_callback result={result!r} attacker={attacker_ip}"
+            )
+
+            if result is None:
+                logging.error("block_callback returned None (INVALID CONTRACT) attacker=%s", attacker_ip)
+                logging.critical("Bloqueo por port scan fallo: callback invalido para attacker=%s", attacker_ip)
+                return
+
+            if result is True:
+                self.blocked_hosts.add(attacker_ip)
+                self.detected_port_scanners.add(detection_key)
+                self.port_scan_tracker.pop(detection_key, None)
+                logging.info("Bloqueo por port scan ejecutado correctamente para attacker=%s", attacker_ip)
+                self._log_port_scan_debug(
+                    f"[PORT SCAN] Block success attacker={attacker_ip} target={target_ip or 'unknown'}"
+                )
+                return
+
+            logging.critical(
+                "Bloqueo por port scan no confirmado attacker=%s result=%r",
+                attacker_ip,
+                result,
+            )
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=callback_failed attacker={attacker_ip} result={result!r}"
+            )
+        except Exception as error:
+            self._log_port_scan_debug(
+                f"[PORT SCAN] Skipping block reason=callback_exception attacker={attacker_ip} error={error}"
+            )
+            logging.error(
+                "Error ejecutando callback de bloqueo por port scan para ip=%s: %s",
+                attacker_ip,
+                error,
+            )
 
     def _register_suspicious_event(self, ip):
         now = time.time()
