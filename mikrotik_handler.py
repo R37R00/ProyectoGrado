@@ -272,6 +272,32 @@ class MikroTikManager:
             result = self._run_with_retry(_unblock)
             return bool(result)
 
+    def clear_connections(self, ip_address):
+        normalized_ip = self._normalize_ip(ip_address)
+        if not normalized_ip:
+            return False
+
+        def _clear():
+            connections = self.api.get_resource("/ip/firewall/connection")
+            removed = 0
+
+            for connection in connections.get():
+                src_address = str(connection.get("src-address", "")).strip()
+                base_src_ip = src_address.split(":")[0] if src_address else ""
+                connection_id = self._get_rule_id(connection)
+                if not connection_id or base_src_ip != normalized_ip:
+                    continue
+
+                connections.remove(id=connection_id)
+                removed += 1
+
+            logging.info("[MIKROTIK CLEAN] ip=%s removed_connections=%s", normalized_ip, removed)
+            return True
+
+        with self.lock:
+            result = self._run_with_retry(_clear)
+            return bool(result)
+
     def block_attacker(self, ip_address, mac_address=None, attack_type="Unknown"):
         _ = mac_address, attack_type
         return self.block_ip(ip_address, mac_address)

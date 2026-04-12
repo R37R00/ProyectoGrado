@@ -850,10 +850,11 @@ class AppController:
             return
 
         if unblocked:
+            self.clear_mikrotik_connections(target_ip)
             self.blocked_ips.discard(target_ip)
             if target_mac:
                 self.blocked_macs.discard(target_mac)
-            self.detection_engine.blocked_hosts.discard(target_ip)
+            self.detection_engine.reset_host_state(target_ip)
             self._upsert_host_record(
                 target_ip,
                 target_mac or target_record.get("mac", "unknown"),
@@ -872,6 +873,25 @@ class AppController:
                     ]
                 )
             )
+
+    def clear_mikrotik_connections(self, ip_address):
+        normalized_ip = self._normalize_ip(ip_address)
+        if not normalized_ip:
+            return False
+
+        if not self.mikrotik or not self.mikrotik.is_connected():
+            logging.warning("[MIKROTIK CLEAN] ip=%s skipped=no_connection", normalized_ip)
+            return False
+
+        try:
+            cleaned = self.mikrotik.clear_connections(normalized_ip)
+            logging.info("[MIKROTIK CLEAN] ip=%s cleaned=%s", normalized_ip, cleaned)
+            if DEBUG:
+                log_debug(f"[MIKROTIK CLEAN] ip={normalized_ip}")
+            return bool(cleaned)
+        except Exception as error:
+            logging.error("[MIKROTIK CLEAN] ip=%s error=%s", normalized_ip, error)
+            return False
 
     def run(self):
         self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())

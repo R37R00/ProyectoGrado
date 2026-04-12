@@ -184,12 +184,16 @@ class DetectionEngine:
         self.local_networks = []
         self.observed_ips = set()
         self.detected_arp_attacks = set()
+        self.scan_tracker = {}
+        self.scan_cleanup_interval_s = 2
+        self.last_scan_cleanup_s = 0
         self.port_scan_tracker = {}
         self.port_scan_window_s = 5
         self.port_scan_threshold = 10
         self.detected_port_scanners = set()
         self.blocked_hosts = set()
         self.attack_contexts = {}
+        self.state_lock = threading.RLock()
 
         self.mitigation_engine = ArpMitigationEngine(self)
 
@@ -517,6 +521,148 @@ class DetectionEngine:
         except Exception as error:
             logging.error("Error construyendo baseline ARP: %s", error)
 
+    def _classify_tcp_scan(self, tcp_flags):
+        if tcp_flags == 0:
+            return "NULL scan"
+        if tcp_flags == 0x01:
+            return "FIN scan"
+        if tcp_flags == 0x29:
+            return "XMAS scan"
+        if tcp_flags == 0x02:
+            return "SYN scan"
+        return None
+
+    def _cleanup_scan_tracker(self, current_time=None, source_ip=None):
+        now = current_time or time.time()
+        cutoff = now - self.port_scan_window_s
+
+        with self.state_lock:
+            tracked_ips = [source_ip] if source_ip else list(self.scan_tracker.keys())
+            for tracked_ip in tracked_ips:
+                if tracked_ip not in self.scan_tracker:
+                    continue
+
+                entry = self.scan_tracker.get(tracked_ip, {})
+                timestamps = [
+                    (timestamp, port)
+                    for timestamp, port in entry.get("timestamps", [])
+                    if timestamp >= cutoff
+                ]
+                if not timestamps:
+                    self.scan_tracker.pop(tracked_ip, None)
+                    continue
+
+                entry["timestamps"] = timestamps
+                entry["ports"] = {port for timestamp, port in timestamps}
+                self.scan_tracker[tracked_ip] = entry
+
+    def _track_behavioral_scan(self, src_ip, dst_ip, dst_port, tcp_flags):
+        attacker_ip = str(src_ip).strip() if src_ip else None
+        target_ip = str(dst_ip).strip() if dst_ip else None
+        if not attacker_ip or dst_port is None or self._is_invalid_ip_candidate(attacker_ip):
+            return
+
+        now = time.time()
+        if now - self.last_scan_cleanup_s >= self.scan_cleanup_interval_s:
+            self._cleanup_scan_tracker(current_time=now)
+            self.last_scan_cleanup_s = now
+
+        with self.state_lock:
+            tracker = self.scan_tracker.setdefault(
+                attacker_ip,
+                {
+                    "ports": set(),
+                    "timestamps": [],
+                },
+            )
+            tracker["timestamps"].append((now, int(dst_port)))
+            tracker["timestamps"] = [
+                (timestamp, port)
+                for timestamp, port in tracker["timestamps"]
+                if timestamp >= now - self.port_scan_window_s
+            ]
+            tracker["ports"] = {port for timestamp, port in tracker["timestamps"]}
+            ports_scanned = sorted(tracker["ports"])
+
+        scan_type = self._classify_tcp_scan(tcp_flags)
+        if DEBUG:
+            log_debug(
+                f"[SCAN DETECT] src_ip={attacker_ip} flags=0x{tcp_flags:02x} "
+                f"ports_scanned={ports_scanned}"
+            )
+
+        if scan_type:
+            self.trigger_alert(
+                f"{scan_type} detected from {attacker_ip}"
+                f"{f' to {target_ip}:{dst_port}' if target_ip else ''}"
+            )
+
+        if len(ports_scanned) >= self.port_scan_threshold:
+            logging.warning(
+                "[SCAN DETECT] src_ip=%s flags=0x%02x ports_scanned=%s",
+                attacker_ip,
+                tcp_flags,
+                ports_scanned,
+            )
+            self.trigger_alert(
+                f"Port scan detected from {attacker_ip} "
+                f"({len(ports_scanned)} unique ports in {self.port_scan_window_s}s)"
+            )
+            self._handle_port_scan(attacker_ip, target_ip, ports_scanned)
+
+    def reset_host_state(self, ip_address):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return
+
+        with self.state_lock:
+            self.scan_tracker.pop(normalized_ip, None)
+            self.port_scan_tracker = {
+                key: value
+                for key, value in self.port_scan_tracker.items()
+                if normalized_ip not in key
+            }
+            self.detected_port_scanners = {
+                entry
+                for entry in self.detected_port_scanners
+                if not (
+                    entry == normalized_ip
+                    or (isinstance(entry, tuple) and normalized_ip in entry)
+                )
+            }
+            self.detected_arp_attacks = {
+                entry
+                for entry in self.detected_arp_attacks
+                if not (
+                    isinstance(entry, tuple) and entry and entry[0] == normalized_ip
+                )
+            }
+            self.blocked_hosts.discard(normalized_ip)
+            self.observed_ips.discard(normalized_ip)
+            self.suspicious_arp_events.pop(normalized_ip, None)
+            self.ip_packet_count.pop(normalized_ip, None)
+            self.attack_contexts = {
+                key: context
+                for key, context in self.attack_contexts.items()
+                if normalized_ip
+                not in {
+                    str(context.get("attacker_ip")).strip() if context.get("attacker_ip") else None,
+                    str(context.get("victim_ip")).strip() if context.get("victim_ip") else None,
+                    str(context.get("gateway_ip")).strip() if context.get("gateway_ip") else None,
+                    str(context.get("spoofed_ip")).strip() if context.get("spoofed_ip") else None,
+                    str(context.get("target_ip")).strip() if context.get("target_ip") else None,
+                }
+            }
+            self.active_attacks = {
+                key: value
+                for key, value in self.active_attacks.items()
+                if normalized_ip not in str(key)
+            }
+
+        logging.info("[STATE RESET] ip=%s", normalized_ip)
+        if DEBUG:
+            log_debug(f"[STATE RESET] ip={normalized_ip}")
+
     def process_packet(self, packet):
         try:
             if IP in packet:
@@ -531,6 +677,7 @@ class DetectionEngine:
                 if TCP in packet:
                     tcp_layer = packet[TCP]
                     tcp_flags = int(tcp_layer.flags)
+                    self._track_behavioral_scan(src_ip, dst_ip, tcp_layer.dport, tcp_flags)
 
                     if tcp_flags & 0x02:
                         self.syn_counter += 1
