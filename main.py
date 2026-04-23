@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from scapy.all import ARP, Ether, IP, conf, get_if_hwaddr, getmacbyip
 
 from detection_engine import DEBUG as DETECTION_DEBUG
@@ -76,9 +76,10 @@ class AppController:
         self.window.packet_text_edit.document().setMaximumBlockCount(200)
         set_gui_event_callback(self.handle_alert)
 
-        self.packet_flush_timer = QTimer()
-        self.packet_flush_timer.setInterval(300)
-        self.packet_flush_timer.timeout.connect(self.flush_packet_events)
+        self.ui_queue = queue.Queue()
+        self.ui_poll_timer = QTimer()
+        self.ui_poll_timer.setInterval(200)
+        self.ui_poll_timer.timeout.connect(self.process_ui_queue)
 
         self.friendly_interfaces = get_friendly_interfaces()
         self.window.set_capture_interfaces(self.friendly_interfaces)
@@ -139,7 +140,15 @@ class AppController:
             return serialized
 
     def _emit_hosts_update(self):
-        self.window.hosts_found_signal.emit(self._serialize_hosts())
+        self._queue_ui_task("update_devices", self._serialize_hosts())
+
+    def _queue_ui_task(self, task_type, data):
+        self.ui_queue.put(
+            {
+                "type": task_type,
+                "data": data,
+            }
+        )
 
     def _upsert_host_record(
         self,
@@ -178,11 +187,27 @@ class AppController:
                 "activity": activity or existing.get("activity", "Normal"),
                 "interfaces": interfaces,
                 "attack_types": attack_types,
+                "last_seen": time.time(),
             }
-            changed = updated_record != existing
+            previous_stable = {
+                key: value
+                for key, value in existing.items()
+                if key != "last_seen"
+            }
+            updated_stable = {
+                key: value
+                for key, value in updated_record.items()
+                if key != "last_seen"
+            }
+            changed = updated_stable != previous_stable
             self.host_records[normalized_ip] = updated_record
 
         if emit and changed:
+            logging.debug(
+                "[DEBUG] Host updated: IP=%s MAC=%s",
+                normalized_ip,
+                updated_record.get("mac", "unknown"),
+            )
             self._emit_hosts_update()
 
     def _extract_host_from_packet(self, packet):
@@ -685,20 +710,57 @@ class AppController:
         self.window.packet_count += 1
         self._register_packet_host(packet)
         self.detection_engine.process_packet(packet)
-        self.packet_event_queue.put(packet.summary())
-
-    def flush_packet_events(self):
-        displayed = 0
-        while displayed < 30:
-            try:
-                summary = self.packet_event_queue.get_nowait()
-            except queue.Empty:
-                break
-            self.window.packet_received_signal.emit(summary)
-            displayed += 1
+        self._queue_ui_task("packet_summary", packet.summary())
 
     def handle_alert(self, message):
-        self.window.anomaly_detected_signal.emit(message)
+        self._queue_ui_task("alert", message)
+
+    def remove_mikrotik_rules(self, ip_address, mac_address=None):
+        normalized_ip = self._normalize_ip(ip_address)
+        normalized_mac = self._normalize_mac(mac_address)
+        if not normalized_ip:
+            return False
+
+        if not self.mikrotik or not self.mikrotik.is_connected():
+            logging.error("MikroTik connection failed or not initialized")
+            return False
+
+        return bool(self.mikrotik.unblock_ip(normalized_ip, normalized_mac))
+
+    def process_ui_queue(self):
+        packet_summaries = []
+        pending_hosts = None
+        alerts = []
+        cleared_alert_ips = []
+
+        while not self.ui_queue.empty():
+            try:
+                task = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            task_type = task.get("type")
+            task_data = task.get("data")
+            if task_type == "update_devices":
+                pending_hosts = task_data
+            elif task_type == "packet_summary":
+                packet_summaries.append(task_data)
+            elif task_type == "alert":
+                alerts.append(task_data)
+            elif task_type == "remove_alerts":
+                cleared_alert_ips.append(task_data)
+
+        for summary in packet_summaries[:30]:
+            self.window.update_packet_display(summary)
+
+        for ip_address in cleared_alert_ips:
+            self.window.remove_alerts_for_ip(ip_address)
+
+        for message in alerts:
+            self.window.update_anomaly_display(message)
+
+        if pending_hosts is not None:
+            self.window.update_hosts_display(pending_hosts)
 
     def start_capture(self, selected_interfaces):
         if not selected_interfaces:
@@ -809,7 +871,8 @@ class AppController:
             )
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.window.anomaly_detected_signal.emit(
+            self._queue_ui_task(
+                "alert",
                 "\n".join(
                     [
                         "[BLOCKED] Attacker blocked",
@@ -818,7 +881,7 @@ class AppController:
                         f"Attacker MAC: {normalized_mac or 'unknown'}",
                         f"Attack Type: {attack_type}",
                     ]
-                )
+                ),
             )
 
             logging.info("[BLOCK] Attacker %s blocked successfully as %s", normalized_ip, attack_type)
@@ -830,7 +893,7 @@ class AppController:
         logging.error("[BLOCK] MikroTik failed to block %s as %s", normalized_ip, attack_type)
         return False
 
-    def unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
+    def _legacy_unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
         resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
         target_ip = resolved_ip or self._normalize_ip(attacker_ip)
         target_record = self._get_host_record(target_ip) if target_ip else {}
@@ -839,6 +902,17 @@ class AppController:
         if not target_ip:
             logging.warning("No attacker IP available for MikroTik unblock")
             return
+
+        if self.detection_engine.is_attack_active(target_ip):
+            answer = QMessageBox.question(
+                self.window,
+                "Ataque activo",
+                "El dispositivo aún presenta un ataque en curso. ¿Desea continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
 
         if self.mikrotik and not self.mikrotik.is_connected():
             self.mikrotik.connect()
@@ -850,6 +924,7 @@ class AppController:
             return
 
         if unblocked:
+            logging.debug("[DEBUG] Unblocking attacker %s", target_ip)
             self.clear_mikrotik_connections(target_ip)
             self.blocked_ips.discard(target_ip)
             if target_mac:
@@ -864,15 +939,75 @@ class AppController:
                 activity="Manual Unblock",
             )
 
-            self.window.anomaly_detected_signal.emit(
+            self._queue_ui_task(
+                "alert",
                 "\n".join(
                     [
                         "[UNBLOCKED] Host allowed again",
                         f"Attacker IP: {target_ip}",
                         f"Attacker MAC: {target_mac or 'unknown'}",
                     ]
-                )
+                ),
             )
+
+    def unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
+        resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
+        target_ip = resolved_ip or self._normalize_ip(attacker_ip)
+        target_record = self._get_host_record(target_ip) if target_ip else {}
+        target_mac = resolved_mac or self._normalize_mac(attacker_mac) or target_record.get("mac")
+
+        if not target_ip:
+            logging.warning("No attacker IP available for MikroTik unblock")
+            return
+
+        if self.detection_engine.is_attack_active(target_ip):
+            answer = QMessageBox.question(
+                self.window,
+                "Ataque activo",
+                "El dispositivo aun presenta un ataque en curso. Desea continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        if self.mikrotik and not self.mikrotik.is_connected():
+            self.mikrotik.connect()
+
+        if not self.mikrotik or not self.mikrotik.is_connected():
+            logging.error("MikroTik connection failed or not initialized")
+            return
+
+        if not self.remove_mikrotik_rules(target_ip, target_mac):
+            return
+
+        logging.debug("[DEBUG] Unblocking attacker %s", target_ip)
+        self.clear_mikrotik_connections(target_ip)
+        self.blocked_ips.discard(target_ip)
+        if target_mac:
+            self.blocked_macs.discard(target_mac)
+        self.detection_engine.clear_attack_state(target_ip)
+        self.detection_engine.reset_host_state(target_ip)
+        self._upsert_host_record(
+            target_ip,
+            target_mac or target_record.get("mac", "unknown"),
+            interface_name=", ".join(sorted(target_record.get("interfaces", set()))) if target_record else None,
+            status="trusted",
+            host_type=target_record.get("type", "Host"),
+            activity="Manual Unblock",
+        )
+
+        self._queue_ui_task("remove_alerts", target_ip)
+        self._queue_ui_task(
+            "alert",
+            "\n".join(
+                [
+                    "[UNBLOCKED] Host allowed again",
+                    f"Attacker IP: {target_ip}",
+                    f"Attacker MAC: {target_mac or 'unknown'}",
+                ]
+            ),
+        )
 
     def clear_mikrotik_connections(self, ip_address):
         normalized_ip = self._normalize_ip(ip_address)
@@ -895,7 +1030,7 @@ class AppController:
 
     def run(self):
         self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
-        self.packet_flush_timer.start()
+        self.ui_poll_timer.start()
         self.window.show()
 
 

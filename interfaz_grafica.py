@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self.anomaly_detected = False
 
         self.hosts = {}
+        self._last_device_items = []
         self.active_alerts = {}
         self.total_alerts = 0
 
@@ -454,13 +455,37 @@ class MainWindow(QMainWindow):
         self.threat_level_label.setText(f"Threat level: {severity}")
         self.anomaly_text.append(raw_message)
 
+    def remove_alerts_for_ip(self, ip_address):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return
+
+        for row in range(self.alerts_table.rowCount() - 1, -1, -1):
+            attacker_item = self.alerts_table.item(row, 2)
+            victim_item = self.alerts_table.item(row, 3)
+            attacker_value = attacker_item.text().strip() if attacker_item else ""
+            victim_value = victim_item.text().strip() if victim_item else ""
+            if normalized_ip in {attacker_value, victim_value}:
+                self.alerts_table.removeRow(row)
+
+        rebuilt_alerts = {}
+        for row in range(self.alerts_table.rowCount()):
+            alert_type = self.alerts_table.item(row, 1).text().strip() if self.alerts_table.item(row, 1) else "Anomaly"
+            attacker = self.alerts_table.item(row, 2).text().strip() if self.alerts_table.item(row, 2) else "Unknown"
+            victim = self.alerts_table.item(row, 3).text().strip() if self.alerts_table.item(row, 3) else "Unknown"
+            rebuilt_alerts[f"{alert_type}|{attacker}|{victim}"] = row
+
+        self.active_alerts = rebuilt_alerts
+        self.total_alerts = self.alerts_table.rowCount()
+        self.tab_widget.setTabText(1, f"Alerts ({self.total_alerts})")
+
     def _normalize_host_status(self, status):
         return (status or "trusted").strip().lower()
 
     def _refresh_hosts_view(self):
         self.hosts_table.setRowCount(0)
         self.hosts_text_edit.clear()
-        self.hosts_combo_box.clear()
+        device_descriptors = []
 
         for row, host_ip in enumerate(sorted(self.hosts)):
             data = self.hosts[host_ip]
@@ -494,10 +519,33 @@ class MainWindow(QMainWindow):
                 f"IFACE: {interface_text}, STATUS: {display_status}"
             )
             self.hosts_text_edit.append(descriptor)
-            self.hosts_combo_box.addItem(descriptor)
+            device_descriptors.append(descriptor)
+
+        self.update_device_selector(device_descriptors)
 
         self.update_status(host_count=len(self.hosts))
         self.total_hosts_label.setText(f"Total hosts detected: {len(self.hosts)}")
+
+    def update_device_selector(self, devices):
+        normalized_devices = list(devices or [])
+        if normalized_devices == self._last_device_items:
+            return
+
+        current_selection = self.hosts_combo_box.currentText().strip()
+        self.hosts_combo_box.blockSignals(True)
+        self.hosts_combo_box.clear()
+        for descriptor in normalized_devices:
+            self.hosts_combo_box.addItem(descriptor)
+
+        if current_selection:
+            restored_index = self.hosts_combo_box.findText(current_selection)
+            if restored_index >= 0:
+                self.hosts_combo_box.setCurrentIndex(restored_index)
+            elif self.hosts_combo_box.count() > 0:
+                self.hosts_combo_box.setCurrentIndex(0)
+
+        self.hosts_combo_box.blockSignals(False)
+        self._last_device_items = normalized_devices
 
     def update_hosts(self, ip, mac, status="unknown", host_type="Host", activity="Normal", interface_name=None):
         if not ip:
@@ -511,7 +559,7 @@ class MainWindow(QMainWindow):
                 if value:
                     interface_names.add(value)
 
-        self.hosts[ip] = {
+        updated_host = {
             "mac": mac or existing.get("mac", "unknown"),
             "status": self._normalize_host_status(status or existing.get("status")),
             "type": host_type or existing.get("type", "Host"),
@@ -519,6 +567,10 @@ class MainWindow(QMainWindow):
             "interfaces": interface_names,
             "interface": ", ".join(sorted(interface_names)) if interface_names else existing.get("interface", "Unknown"),
         }
+        if updated_host == existing:
+            return
+
+        self.hosts[ip] = updated_host
         self._refresh_hosts_view()
 
     def update_status(self, monitoring_on=None, interface=None, host_count=None, protection_on=None):
@@ -546,6 +598,16 @@ class MainWindow(QMainWindow):
             if "ARP" in first_line:
                 alert_type = "ARP Spoofing"
                 severity = "HIGH"
+            elif "Port Scan" in first_line:
+                alert_type = "Port Scan"
+                severity = "HIGH"
+            elif "[ALERT]" in first_line and "DoS" in first_line:
+                alert_type = "DoS"
+                severity = "HIGH"
+            elif "[BLOCK]" in first_line and "DoS attacker blocked" in first_line:
+                alert_type = "Blocked"
+                status = "Blocked"
+                severity = "HIGH"
             elif "[BLOCKED]" in first_line:
                 alert_type = "Blocked"
                 status = "Blocked"
@@ -563,6 +625,8 @@ class MainWindow(QMainWindow):
             elif line.startswith("Attacker IP:"):
                 attacker = line.split(":", 1)[1].strip()
             elif line.startswith("Victim IP:"):
+                victim = line.split(":", 1)[1].strip()
+            elif line.startswith("Target IP:") and victim == "Unknown":
                 victim = line.split(":", 1)[1].strip()
             elif line.startswith("Spoofed IP:") and victim == "Unknown":
                 victim = line.split(":", 1)[1].strip()
@@ -611,6 +675,9 @@ class MainWindow(QMainWindow):
                 "interfaces": interface_names,
                 "interface": ", ".join(sorted(interface_names)) if interface_names else "Unknown",
             }
+
+        if merged_hosts == self.hosts:
+            return
 
         self.hosts = merged_hosts
         self._refresh_hosts_view()

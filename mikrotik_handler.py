@@ -245,15 +245,14 @@ class MikroTikManager:
         if not normalized_ip and not normalized_mac:
             return False
 
-        def _unblock():
-            firewall = self.api.get_resource("/ip/firewall/filter")
-            tracked_state = self.blocked_rules.get(normalized_ip, {})
+        def _remove_rules_by_comments(firewall, ip_value):
+            tracked_state = self.blocked_rules.get(ip_value, {})
             tracked_ids = set(tracked_state.get("ids", []))
             tracked_comments = set(tracked_state.get("comments", []))
-            if normalized_ip:
-                tracked_comments.update(self._tracked_comments_for_ip(normalized_ip))
+            if ip_value:
+                tracked_comments.update(self._tracked_comments_for_ip(ip_value))
 
-            removed = False
+            removed = 0
             for rule in firewall.get():
                 comment = rule.get("comment", "")
                 rule_id = self._get_rule_id(rule)
@@ -261,12 +260,22 @@ class MikroTikManager:
                     continue
                 if rule_id in tracked_ids or comment in tracked_comments:
                     firewall.remove(id=rule_id)
-                    removed = True
+                    removed += 1
 
-            if removed:
-                logging.info("[INFO] Unblocked attacker IP: %s", normalized_ip or "unknown")
-            self.blocked_rules.pop(normalized_ip, None)
+            logging.info(
+                "[MIKROTIK] Rule cleanup for ip=%s removed=%s comments=%s",
+                ip_value or "unknown",
+                removed,
+                sorted(tracked_comments),
+            )
+            self.blocked_rules.pop(ip_value, None)
             return removed
+
+        def _unblock():
+            firewall = self.api.get_resource("/ip/firewall/filter")
+            removed = _remove_rules_by_comments(firewall, normalized_ip)
+            logging.info("[INFO] Unblocked attacker IP: %s removed_rules=%s", normalized_ip or "unknown", removed)
+            return True
 
         with self.lock:
             result = self._run_with_retry(_unblock)
