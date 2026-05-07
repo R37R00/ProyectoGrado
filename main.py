@@ -1,1044 +1,1369 @@
-import logging
 import ipaddress
+import logging
 import queue
-import socket
-import sys
 import threading
+import tkinter as tk
 import time
+from collections import deque
 from datetime import datetime
+from tkinter import messagebox, ttk
 
-from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QApplication, QMessageBox
-from scapy.all import ARP, Ether, IP, conf, get_if_hwaddr, getmacbyip
+from scapy.all import ARP, Ether, IP
 
-from detection_engine import DEBUG as DETECTION_DEBUG
-from detection_engine import DetectionEngine
-from event_logger import log_debug, log_event, set_gui_event_callback
-from interfaz_grafica import MainWindow
-from mikrotik_config import get_active_mikrotik_config, resolve_mikrotik_config
+from core.capture import CaptureService, format_packet_record, list_available_interfaces
+from core.detection import DetectionService
+from event_logger import set_gui_event_callback
+from mikrotik_config import (
+    MikroTikConfig,
+    get_active_mikrotik_config,
+    load_mikrotik_config_from_env,
+    set_active_mikrotik_config,
+)
 from mikrotik_handler import MikroTikManager
-from network_capture import NetworkCaptureScanner
-
-
-DEBUG = True
+from ui.interface_selection import InterfaceSelectionView
+from ui.packet_view import PacketView
+from ui.router_config import RouterConfigView
 
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 
-def get_friendly_interfaces():
-    interfaces = []
-    try:
-        for iface in conf.ifaces.values():
-            real_name = getattr(iface, "name", None)
-            if not real_name:
-                continue
-
-            friendly_name = getattr(iface, "description", "") or real_name
-            interfaces.append((friendly_name, real_name))
-    except Exception as error:
-        logging.error("Error al obtener interfaces amigables: %s", error)
-
-    unique = {}
-    for friendly_name, real_name in interfaces:
-        if real_name not in unique:
-            unique[real_name] = friendly_name
-
-    return [(friendly_name, real_name) for real_name, friendly_name in unique.items()]
-
-
 class AppController:
-    def __init__(self):
-        conf.verb = 1
+    CONNECTION_TIMEOUT_MS = 8000
+    ATTACK_RESOLVE_TIMEOUT_S = 30
 
-        self.window = MainWindow()
-        self.detection_engine = DetectionEngine()
-        self.packet_event_queue = queue.Queue()
-        self.host_records = {}
-        self.host_lock = threading.RLock()
-        self.protected_ips = set()
-        self.protected_macs = set()
-        self.local_networks = []
-        self.gateway_ips = set()
-        self.gateway_ip = None
-        self.local_interface_ips = set()
-        self.own_host_ip = None
-        self.own_host_mac = None
-        self.mikrotik_ip = None
-        self.mikrotik_config = get_active_mikrotik_config()
-        self.mikrotik = None
-        self.blocked_ips = set()
-        self.blocked_macs = set()
-
-        self.window.packet_text_edit.document().setMaximumBlockCount(200)
-        set_gui_event_callback(self.handle_alert)
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema IDS - Monitor de Trafico")
+        self.root.geometry("1360x820")
+        self.root.minsize(1180, 720)
+        self.root.configure(bg="#0f172a")
 
         self.ui_queue = queue.Queue()
-        self.ui_poll_timer = QTimer()
-        self.ui_poll_timer.setInterval(200)
-        self.ui_poll_timer.timeout.connect(self.process_ui_queue)
+        self.packet_pipeline_queue = queue.Queue(maxsize=2000)
+        self.mikrotik_action_queue = queue.Queue()
+        self.services_lock = threading.RLock()
+        self.capture_service = None
+        self.detection_service = None
+        self.mikrotik_manager = None
+        self.current_view = None
+        self.interface_view = None
+        self.router_view = None
+        self.packet_view = None
+        self.selected_interface = None
+        self.packet_counter = 0
+        self.packet_counter_lock = threading.Lock()
+        self.packet_buffer = []
+        self.packet_buffer_lock = threading.Lock()
+        self.packet_flush_limit = 250
+        self.packet_buffer_max = 1500
+        self.hosts = {}
+        self.host_lock = threading.RLock()
+        self.host_update_pending = False
+        self.security_event_lock = threading.RLock()
+        self.active_attacks = {}
+        self.event_history = deque(maxlen=1000)
+        self.security_update_pending = False
+        self.startup_in_progress = False
+        self.deferred_events = []
+        self.startup_token = 0
+        self.connection_timeout_job = None
+        self.worker_stop_event = threading.Event()
+        self.queue_drop_notice_at = 0.0
 
-        self.friendly_interfaces = get_friendly_interfaces()
-        self.window.set_capture_interfaces(self.friendly_interfaces)
+        self._configure_style()
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        set_gui_event_callback(self.handle_alert)
 
-        selected_interfaces = self.window.get_selected_capture_interfaces()
-        selected_interface = selected_interfaces[0] if selected_interfaces else None
-        self.network_capture = NetworkCaptureScanner(
-            packet_callback=self.handle_packet,
-            hosts_callback=self.handle_hosts_found,
-            interface=selected_interface,
+        self.container = ttk.Frame(self.root, style="App.TFrame", padding=18)
+        self.container.pack(fill="both", expand=True)
+
+        self.packet_pipeline_thread = threading.Thread(target=self._packet_pipeline_worker, daemon=True)
+        self.packet_pipeline_thread.start()
+        self.mikrotik_worker_thread = threading.Thread(target=self._mikrotik_action_worker, daemon=True)
+        self.mikrotik_worker_thread.start()
+
+        self.show_interface_selection()
+        self.process_ui_queue()
+
+    def _configure_style(self):
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+
+        style.configure("App.TFrame", background="#0f172a")
+        style.configure("Card.TFrame", background="#111827", relief="flat")
+        style.configure("Panel.TFrame", background="#0b1220", relief="flat")
+        style.configure("SectionTitle.TLabel", background="#111827", foreground="#f8fafc", font=("Segoe UI", 18, "bold"))
+        style.configure("Muted.TLabel", background="#111827", foreground="#94a3b8", font=("Segoe UI", 10))
+        style.configure("Body.TLabel", background="#111827", foreground="#e2e8f0", font=("Segoe UI", 11))
+        style.configure("StatusValue.TLabel", background="#0b1220", foreground="#f8fafc", font=("Segoe UI", 12, "bold"))
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(16, 10), background="#2563eb", foreground="#ffffff")
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#1d4ed8"), ("disabled", "#334155")],
+            foreground=[("disabled", "#cbd5e1")],
+        )
+        style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(14, 10), background="#1f2937", foreground="#e5e7eb")
+        style.map(
+            "Secondary.TButton",
+            background=[("active", "#374151"), ("disabled", "#1f2937")],
+            foreground=[("disabled", "#6b7280")],
+        )
+        style.configure("Card.TLabelframe", background="#111827", foreground="#f8fafc", borderwidth=1)
+        style.configure("Card.TLabelframe.Label", background="#111827", foreground="#f8fafc", font=("Segoe UI", 10, "bold"))
+        style.configure("TEntry", fieldbackground="#0b1220", foreground="#f8fafc", insertcolor="#f8fafc", borderwidth=1)
+        style.configure("Treeview", background="#0b1220", fieldbackground="#0b1220", foreground="#e2e8f0", rowheight=28, borderwidth=0)
+        style.map("Treeview", background=[("selected", "#1d4ed8")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background="#1f2937", foreground="#f8fafc", font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#334155")])
+
+    def _set_view(self, widget):
+        if self.current_view is not None:
+            self.current_view.destroy()
+        self.current_view = widget
+        self.current_view.pack(fill="both", expand=True)
+
+    def _cancel_connection_timeout(self):
+        if self.connection_timeout_job is not None:
+            try:
+                self.root.after_cancel(self.connection_timeout_job)
+            except tk.TclError:
+                pass
+            self.connection_timeout_job = None
+
+    def _reset_runtime_services(self):
+        with self.services_lock:
+            self.capture_service = None
+            self.detection_service = None
+            self.mikrotik_manager = None
+
+    def _cleanup_services(self, capture_service=None, mikrotik_manager=None):
+        if capture_service is not None:
+            try:
+                capture_service.stop()
+            except Exception as error:
+                logging.debug("Error stopping capture during cleanup: %s", error)
+        if mikrotik_manager is not None:
+            try:
+                mikrotik_manager.disconnect()
+            except Exception as error:
+                logging.debug("Error disconnecting MikroTik during cleanup: %s", error)
+
+    def show_interface_selection(self):
+        interfaces = list_available_interfaces()
+        self.interface_view = InterfaceSelectionView(
+            self.container,
+            on_continue=self._handle_interface_selected,
+            on_refresh=self.show_interface_selection,
+        )
+        self.interface_view.populate_interfaces(interfaces)
+        self._set_view(self.interface_view)
+
+    def _handle_interface_selected(self, interface_info):
+        self.selected_interface = interface_info
+        defaults = get_active_mikrotik_config() or load_mikrotik_config_from_env()
+        self.router_view = RouterConfigView(
+            self.container,
+            interface_info=interface_info,
+            defaults=defaults,
+            on_accept=self._begin_startup,
+            on_cancel=self._cancel_startup,
+        )
+        self._set_view(self.router_view)
+
+    def _validate_router_config(self, values):
+        host_value = (values.get("host") or "").strip()
+        username = (values.get("username") or "").strip()
+        password = values.get("password")
+        port_text = (values.get("port") or "").strip()
+
+        if not host_value:
+            raise ValueError("MikroTik IP is required.")
+        try:
+            ipaddress.IPv4Address(host_value)
+        except ValueError as error:
+            raise ValueError("MikroTik IP must be a valid IPv4 address.") from error
+
+        if not username:
+            raise ValueError("Username is required.")
+
+        if not port_text:
+            raise ValueError("API Port is required.")
+        if not port_text.isdigit():
+            raise ValueError("API Port must contain only numbers.")
+
+        port_value = int(port_text)
+        if port_value < 1 or port_value > 65535:
+            raise ValueError("API Port must be between 1 and 65535.")
+
+        return MikroTikConfig(
+            host=host_value,
+            username=username,
+            password=password,
+            port=port_value,
+        ).normalized()
+
+    def _begin_startup(self, form_values):
+        if self.startup_in_progress:
+            return
+        if not self.selected_interface:
+            messagebox.showerror("Interface", "Select a network interface before continuing.")
+            self.show_interface_selection()
+            return
+
+        try:
+            config = self._validate_router_config(form_values)
+        except ValueError as error:
+            self.router_view.set_message(str(error), is_error=True)
+            return
+
+        self.startup_token += 1
+        startup_token = self.startup_token
+        self.startup_in_progress = True
+        self._reset_runtime_services()
+
+        logging.info("[UI] Starting MikroTik connection thread")
+        self.router_view.set_busy(True, "Connecting to MikroTik...", keep_cancel_enabled=True)
+        self._cancel_connection_timeout()
+        self.connection_timeout_job = self.root.after(
+            self.CONNECTION_TIMEOUT_MS,
+            lambda token=startup_token: self._handle_connection_timeout(token),
         )
 
-        self.detection_engine.set_alert_callback(self.handle_alert)
-        self.detection_engine.set_block_callback(self.block_attacker_connection)
-        self.detection_engine.set_capture_interface(selected_interface)
-        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
+        worker = threading.Thread(
+            target=self._connect_mikrotik_worker,
+            args=(startup_token, self.selected_interface, config),
+            daemon=True,
+        )
+        worker.start()
 
-        self.window.bind_actions(
-            start_callback=self.start_capture,
-            pause_callback=self.pause_capture,
-            continue_callback=self.continue_capture,
-            stop_callback=self.stop_capture,
-            find_hosts_callback=self.find_hosts,
-            block_host_callback=self.block_attacker_connection,
-            unblock_host_callback=self.unblock_attacker_connection,
+    def _connect_mikrotik_worker(self, startup_token, interface_info, config):
+        mikrotik_manager = None
+        try:
+            mikrotik_manager = MikroTikManager(
+                host=config.host,
+                username=config.username,
+                password=config.password,
+                port=config.port,
+            )
+            success = mikrotik_manager.connect()
+            if startup_token != self.startup_token:
+                self._cleanup_services(mikrotik_manager=mikrotik_manager)
+                return
+
+            if success:
+                self.root.after(
+                    0,
+                    lambda: self.on_connection_success(
+                        startup_token,
+                        interface_info,
+                        config,
+                        mikrotik_manager,
+                    ),
+                )
+                return
+
+            raise RuntimeError("Could not connect to the MikroTik router. Check IP, credentials, and API port.")
+        except Exception as error:
+            self._cleanup_services(mikrotik_manager=mikrotik_manager)
+            self.root.after(0, lambda: self.on_connection_failed(startup_token, str(error)))
+
+    def _handle_connection_timeout(self, startup_token):
+        if startup_token != self.startup_token or not self.startup_in_progress:
+            return
+
+        logging.error("[UI] MikroTik connection timeout")
+        self.startup_in_progress = False
+        self.startup_token += 1
+        self.connection_timeout_job = None
+        if self.router_view is not None:
+            self.router_view.set_busy(False, "Connection timed out.", keep_cancel_enabled=True)
+            self.router_view.set_message("The MikroTik connection did not respond in time.", is_error=True)
+        messagebox.showerror("Connection timeout", "The MikroTik connection did not respond in time.")
+        self.show_interface_selection()
+
+    def on_connection_success(self, startup_token, interface_info, config, mikrotik_manager):
+        if startup_token != self.startup_token or not self.startup_in_progress:
+            self._cleanup_services(mikrotik_manager=mikrotik_manager)
+            return
+
+        self._cancel_connection_timeout()
+        logging.info("[UI] MikroTik connection successful")
+        logging.info("[UI] Switching to capture screen")
+
+        if self.router_view is not None:
+            self.router_view.set_busy(False, "Connected successfully. Preparing capture...", keep_cancel_enabled=False)
+
+        self._show_packet_view(
+            {
+                "interface": interface_info,
+                "config": config,
+                "interface_ip": interface_info.ip_address or "N/A",
+                "interface_network": "Initializing...",
+            }
+        )
+        self.packet_view.set_mikrotik_status("Connected successfully", connected=True)
+        self.packet_view.set_capture_status("Initializing...")
+        self.packet_view.append_log("[UI] MikroTik connection successful", level="info")
+        self.packet_view.append_log("[UI] Switching to capture screen", level="info")
+        self.start_packet_capture(startup_token, interface_info, config, mikrotik_manager)
+
+    def on_connection_failed(self, startup_token, error_message):
+        if startup_token != self.startup_token:
+            return
+
+        self._cancel_connection_timeout()
+        self.startup_in_progress = False
+        logging.error("[UI] MikroTik connection failed: %s", error_message)
+        if self.router_view is not None:
+            self.router_view.set_busy(False, "", keep_cancel_enabled=True)
+            self.router_view.set_message(error_message, is_error=True)
+        messagebox.showerror("Connection error", error_message)
+        self.show_interface_selection()
+
+    def _initialize_capture_worker(self, startup_token, interface_info, config, mikrotik_manager):
+        capture_service = None
+        detection_service = None
+        try:
+            capture_service = CaptureService(packet_callback=self.handle_packet)
+            interface_ip = capture_service.get_interface_ip(interface_info.identifier)
+            interface_network = capture_service.get_interface_network(interface_info.identifier)
+
+            detection_service = DetectionService(
+                alert_callback=self.handle_alert,
+                block_callback=self.block_attacker_connection,
+            )
+            protection = detection_service.configure_for_capture(
+                interface_name=interface_info.identifier,
+                interface_ip=interface_ip,
+                interface_network=interface_network,
+                mikrotik_ip=config.host,
+            )
+            mikrotik_manager.set_protected_hosts(protection.protected_ips, protection.protected_macs)
+
+            with self.services_lock:
+                if startup_token != self.startup_token:
+                    self._cleanup_services(capture_service=capture_service, mikrotik_manager=mikrotik_manager)
+                    return
+                self.capture_service = capture_service
+                self.detection_service = detection_service
+                self.mikrotik_manager = mikrotik_manager
+
+            if not capture_service.start(interface_info.identifier):
+                raise RuntimeError("The packet capture could not be started on the selected interface.")
+
+            self.root.after(
+                0,
+                lambda: self._finalize_capture_startup(
+                    startup_token,
+                    {
+                        "interface": interface_info,
+                        "config": config,
+                        "interface_ip": interface_ip or "N/A",
+                        "interface_network": str(interface_network) if interface_network else "N/A",
+                    },
+                ),
+            )
+
+            detection_service.build_baseline(interface_network=interface_network)
+            self.root.after(
+                0,
+                lambda: self._append_runtime_log(
+                    f"[IDS] Baseline ready on {interface_info.identifier}",
+                    level="info",
+                ),
+            )
+        except Exception as error:
+            self._cleanup_services(capture_service=capture_service, mikrotik_manager=mikrotik_manager)
+            self._reset_runtime_services()
+            self.root.after(0, lambda: self._handle_capture_startup_failure(startup_token, str(error)))
+
+    def start_packet_capture(self, startup_token, interface_info, config, mikrotik_manager):
+        logging.info("[CAPTURE] Scheduling packet capture startup for interface: %s", interface_info.identifier)
+        if self.packet_view is not None:
+            self.packet_view.set_capture_status("Starting sniff...")
+            self.packet_view.append_log(
+                f"[CAPTURE] Starting sniff on interface: {interface_info.identifier}",
+                level="info",
+            )
+
+        worker = threading.Thread(
+            target=self._initialize_capture_worker,
+            args=(startup_token, interface_info, config, mikrotik_manager),
+            daemon=True,
+        )
+        worker.start()
+
+    def _finalize_capture_startup(self, startup_token, startup_data):
+        if startup_token != self.startup_token:
+            return
+
+        self.startup_in_progress = False
+        self.packet_view.set_interface(startup_data["interface"].name, startup_data["interface_ip"])
+        self.packet_view.set_mikrotik_status(
+            f"Connected to {startup_data['config'].host}:{startup_data['config'].port}",
+            connected=True,
+        )
+        self.packet_view.set_capture_status("Running")
+        self.packet_view.append_log(
+            f"Capture started on {startup_data['interface'].name} ({startup_data['interface'].identifier}) | Network {startup_data['interface_network']}",
+            level="info",
         )
 
-    def _get_primary_interface(self, selected_interfaces=None):
-        if selected_interfaces:
-            return selected_interfaces[0]
-        return self.window.get_selected_capture_interface()
+    def _append_runtime_log(self, message, level="info"):
+        if self.packet_view is not None:
+            self.packet_view.append_log(message, level=level)
+        else:
+            self.ui_queue.put({"type": "log", "data": {"message": message, "level": level}})
 
-    def _normalize_status(self, status):
-        return (status or "trusted").strip().lower()
+    def _rate_limited_warning(self, key, message, interval_s=5.0):
+        now = time.time()
+        if now - self.queue_drop_notice_at < interval_s:
+            return
+        self.queue_drop_notice_at = now
+        logging.warning("%s", message)
 
-    def _get_host_record(self, ip_address):
-        with self.host_lock:
-            record = self.host_records.get(ip_address, {})
-            return dict(record)
+    def _packet_pipeline_worker(self):
+        while not self.worker_stop_event.is_set():
+            try:
+                packet = self.packet_pipeline_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self._track_packet_hosts(packet)
+
+                with self.packet_counter_lock:
+                    self.packet_counter += 1
+                    packet_number = self.packet_counter
+
+                with self.services_lock:
+                    detection_service = self.detection_service
+
+                if detection_service is not None:
+                    detection_service.process_packet(packet)
+
+                packet_record = format_packet_record(packet, packet_number)
+                with self.packet_buffer_lock:
+                    self.packet_buffer.append(packet_record)
+                    if len(self.packet_buffer) > self.packet_buffer_max:
+                        overflow = len(self.packet_buffer) - self.packet_buffer_max
+                        if overflow > 0:
+                            del self.packet_buffer[:overflow]
+            except Exception as error:
+                logging.error("[PIPELINE] Error processing packet: %s", error)
+            finally:
+                self.packet_pipeline_queue.task_done()
+
+    def _run_mikrotik_action(self, action, **payload):
+        request = {
+            "action": action,
+            "payload": payload,
+            "event": threading.Event(),
+            "result": False,
+        }
+        self.mikrotik_action_queue.put(request)
+        request["event"].wait(timeout=2.5)
+        return bool(request.get("result"))
+
+    def _queue_mikrotik_action(self, action, **payload):
+        self.mikrotik_action_queue.put(
+            {
+                "action": action,
+                "payload": payload,
+                "event": None,
+                "result": None,
+            }
+        )
+
+    def _mikrotik_action_worker(self):
+        while not self.worker_stop_event.is_set():
+            try:
+                request = self.mikrotik_action_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            result = False
+            try:
+                action = request.get("action")
+                payload = request.get("payload", {})
+                if action == "block":
+                    result = self._execute_block_request(**payload)
+                elif action == "unblock":
+                    result = self._execute_unblock_request(**payload)
+            except Exception as error:
+                logging.error("[MIKROTIK] Worker action failed: %s", error)
+            finally:
+                request["result"] = result
+                if request.get("event") is not None:
+                    request["event"].set()
+                self.mikrotik_action_queue.task_done()
+
+    def _execute_block_request(self, ip_address, mac_address=None, attack_type="Unknown"):
+        with self.services_lock:
+            mikrotik_manager = self.mikrotik_manager
+            detection_service = self.detection_service
+        if mikrotik_manager is None:
+            return False
+        if not mikrotik_manager.is_connected() and not mikrotik_manager.connect():
+            self.ui_queue.put({"type": "status", "data": {"text": "Disconnected", "connected": False}})
+            self._set_host_status(ip_address, "suspicious", attack_type=attack_type, clear_block=True)
+            self._append_runtime_log(f"Failed to block {ip_address} ({attack_type}).", level="error")
+            return False
+        self.ui_queue.put({"type": "status", "data": {"text": "Connected", "connected": True}})
+        attack_context = detection_service.get_attack_context(ip_address, mac_address) if detection_service is not None else None
+        victim_ip = attack_context.get("victim_ip") if attack_context else None
+        victim_mac = attack_context.get("victim_mac") if attack_context else None
+        if not victim_ip:
+            with self.security_event_lock:
+                for attack in self.active_attacks.values():
+                    if attack.get("attacker") == ip_address:
+                        victim_ip = attack.get("victim")
+                        victim_mac = victim_mac or attack.get("victim_mac")
+                        break
+
+        block_result = bool(mikrotik_manager.block_attacker(ip_address, mac_address, attack_type=attack_type))
+        router_has_rules = False
+        try:
+            router_has_rules = bool(mikrotik_manager.is_ip_blocked_in_router(ip_address))
+        except Exception as error:
+            logging.error("[MIKROTIK] Could not validate block rules for %s: %s", ip_address, error)
+
+        blocked = block_result or router_has_rules
+        if blocked:
+            self._set_host_status(ip_address, "blocked", attack_type=attack_type)
+            self._upsert_attack_event(
+                attack_type,
+                attacker_ip=ip_address,
+                victim_ip=victim_ip,
+                status="blocked",
+                attacker_mac=mac_address,
+                victim_mac=victim_mac,
+            )
+            self._append_runtime_log(
+                f"Blocked attacker={ip_address} victim={victim_ip or 'unknown'} victim_mac={victim_mac or 'unknown'} attack={attack_type}.",
+                level="alert",
+            )
+            if detection_service is not None and attack_context:
+                threading.Thread(
+                    target=self._activate_post_block_mitigation,
+                    args=(detection_service, attack_context, attack_type, ip_address, victim_ip),
+                    daemon=True,
+                ).start()
+        else:
+            self._set_host_status(ip_address, "suspicious", attack_type=attack_type, clear_block=True)
+            self._upsert_attack_event(
+                attack_type,
+                attacker_ip=ip_address,
+                victim_ip=victim_ip,
+                status="block failed",
+                attacker_mac=mac_address,
+                victim_mac=victim_mac,
+            )
+            self._append_runtime_log(
+                f"Failed to block attacker={ip_address} victim={victim_ip or 'unknown'} attack={attack_type}; router rules were not found.",
+                level="error",
+            )
+        return blocked
+
+    def _activate_post_block_mitigation(self, detection_service, attack_context, attack_type, attacker_ip, victim_ip):
+        mitigated = detection_service.activate_post_block_mitigation(attack_context)
+        if mitigated:
+            self._upsert_attack_event(
+                attack_type,
+                attacker_ip=attacker_ip,
+                victim_ip=victim_ip,
+                status="mitigated",
+                attacker_mac=attack_context.get("attacker_mac"),
+                victim_mac=attack_context.get("victim_mac"),
+            )
+            self.ui_queue.put(
+                {
+                    "type": "log",
+                    "data": {
+                        "message": f"Mitigation applied attacker={attacker_ip} victim={victim_ip or 'unknown'} attack={attack_type}.",
+                        "level": "alert",
+                    },
+                }
+            )
+
+    def _execute_unblock_request(self, ip_address, mac_address=None):
+        with self.services_lock:
+            mikrotik_manager = self.mikrotik_manager
+        if mikrotik_manager is None:
+            return False
+        if not mikrotik_manager.is_connected() and not mikrotik_manager.connect():
+            self.ui_queue.put({"type": "status", "data": {"text": "Disconnected", "connected": False}})
+            return False
+        self.ui_queue.put({"type": "status", "data": {"text": "Connected", "connected": True}})
+        return bool(mikrotik_manager.unblock_attacker(ip_address, mac_address))
+
+    def _format_last_seen(self, timestamp_value):
+        if not timestamp_value:
+            return "-"
+        return datetime.fromtimestamp(float(timestamp_value)).strftime("%H:%M:%S")
 
     def _serialize_hosts(self):
         with self.host_lock:
             serialized = []
-            for ip_address in sorted(self.host_records):
-                data = self.host_records[ip_address]
-                interfaces = sorted(data.get("interfaces", set()))
+            for ip_address in sorted(self.hosts):
+                host = dict(self.hosts[ip_address])
                 serialized.append(
                     {
-                        "ip": ip_address,
-                        "mac": data.get("mac", "unknown"),
-                        "interface": ", ".join(interfaces) if interfaces else "Unknown",
-                        "status": self._normalize_status(data.get("status")),
-                        "type": data.get("type", "Host"),
-                        "activity": data.get("activity", "Normal"),
-                        "attack_types": sorted(data.get("attack_types", set())),
+                        "ip": host.get("ip", ip_address),
+                        "mac": host.get("mac") or "unknown",
+                        "status": host.get("status", "active"),
+                        "is_blocked": bool(host.get("is_blocked", False)),
+                        "block_type": host.get("block_type"),
+                        "attack_type": host.get("attack_type"),
+                        "display_status": self._format_host_status_label(host),
+                        "last_seen": self._format_last_seen(host.get("last_seen")),
                     }
                 )
             return serialized
 
-    def _emit_hosts_update(self):
-        self._queue_ui_task("update_devices", self._serialize_hosts())
+    def _refresh_hosts_table(self):
+        self.host_update_pending = False
+        if self.packet_view is not None:
+            self.packet_view.update_hosts(self._serialize_hosts())
 
-    def _queue_ui_task(self, task_type, data):
-        self.ui_queue.put(
-            {
-                "type": task_type,
-                "data": data,
-            }
-        )
-
-    def _upsert_host_record(
-        self,
-        ip_address,
-        mac_address=None,
-        interface_name=None,
-        status=None,
-        activity=None,
-        host_type=None,
-        attack_type=None,
-        emit=True,
-    ):
-        normalized_ip = self._normalize_ip(ip_address)
-        normalized_mac = self._normalize_mac(mac_address)
-        if not normalized_ip:
+    def _schedule_hosts_refresh(self):
+        if self.host_update_pending:
             return
+        self.host_update_pending = True
+        try:
+            self.root.after(200, self._refresh_hosts_table)
+        except tk.TclError:
+            self.host_update_pending = False
 
-        changed = False
+    def _format_event_timestamp(self, timestamp_value=None, include_date=True):
+        timestamp_value = timestamp_value or time.time()
+        pattern = "%Y-%m-%d %H:%M:%S" if include_date else "%H:%M:%S"
+        return datetime.fromtimestamp(float(timestamp_value)).strftime(pattern)
+
+    def _normalize_attack_type(self, attack_type):
+        value = str(attack_type or "Unknown").strip()
+        upper_value = value.upper().replace("_", " ")
+        if "ARP" in upper_value:
+            return "ARP Spoofing"
+        if "PORT" in upper_value or "SCAN" in upper_value:
+            return "Port Scan"
+        if "DOS" in upper_value or "FLOOD" in upper_value:
+            return "DoS"
+        if value.lower() == "manual":
+            return "Manual"
+        return value or "Unknown"
+
+    def _severity_for_attack(self, attack_type):
+        normalized = self._normalize_attack_type(attack_type).lower()
+        if "arp" in normalized or "dos" in normalized:
+            return "critical"
+        if "scan" in normalized:
+            return "warning"
+        return "suspicious"
+
+    def _get_host_mac(self, ip_address):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return None
         with self.host_lock:
-            existing = self.host_records.get(normalized_ip, {})
-            interfaces = set(existing.get("interfaces", set()))
-            attack_types = set(existing.get("attack_types", set()))
-            if interface_name:
-                for value in str(interface_name).split(","):
-                    value = value.strip()
-                    if value:
-                        interfaces.add(value)
+            mac_address = self.hosts.get(normalized_ip, {}).get("mac")
+        if not mac_address or mac_address == "unknown":
+            return None
+        return mac_address
 
-            if attack_type:
-                attack_types.add(str(attack_type).strip())
-
-            updated_record = {
-                "mac": normalized_mac or existing.get("mac", "unknown"),
-                "status": self._normalize_status(status or existing.get("status") or "trusted"),
-                "type": host_type or existing.get("type", "Host"),
-                "activity": activity or existing.get("activity", "Normal"),
-                "interfaces": interfaces,
-                "attack_types": attack_types,
-                "last_seen": time.time(),
-            }
-            previous_stable = {
-                key: value
-                for key, value in existing.items()
-                if key != "last_seen"
-            }
-            updated_stable = {
-                key: value
-                for key, value in updated_record.items()
-                if key != "last_seen"
-            }
-            changed = updated_stable != previous_stable
-            self.host_records[normalized_ip] = updated_record
-
-        if emit and changed:
-            logging.debug(
-                "[DEBUG] Host updated: IP=%s MAC=%s",
-                normalized_ip,
-                updated_record.get("mac", "unknown"),
-            )
-            self._emit_hosts_update()
-
-    def _extract_host_from_packet(self, packet):
-        interface_name = getattr(packet, "capture_interface", None) or getattr(packet, "sniffed_on", None)
-        if packet.haslayer(ARP):
-            arp_layer = packet[ARP]
-            return arp_layer.psrc, self._normalize_mac(arp_layer.hwsrc), interface_name
-
-        if packet.haslayer(IP) and packet.haslayer(Ether):
-            ip_layer = packet[IP]
-            ethernet_layer = packet[Ether]
-            return ip_layer.src, self._normalize_mac(ethernet_layer.src), interface_name
-
-        return None, None, interface_name
-
-    def _register_packet_host(self, packet):
-        ip_address, mac_address, interface_name = self._extract_host_from_packet(packet)
-        if not ip_address or not mac_address:
-            return
-        self._upsert_host_record(
-            ip_address,
-            mac_address,
-            interface_name=interface_name,
-            emit=True,
+    def _attack_key(self, attack_type, attacker_ip, victim_ip=None):
+        return (
+            self._normalize_attack_type(attack_type),
+            str(attacker_ip or "unknown").strip(),
+            str(victim_ip or "unknown").strip(),
         )
 
-    def handle_hosts_found(self, hosts):
-        if not hosts:
-            return
-
-        for host in hosts:
-            self._upsert_host_record(
-                host.get("ip"),
-                host.get("mac"),
-                interface_name=host.get("interface"),
-                status=host.get("status", "trusted"),
-                activity=host.get("activity", "Discovered"),
-                host_type=host.get("type", "Host"),
-                emit=False,
+    def _serialize_active_attacks(self):
+        with self.security_event_lock:
+            attacks = sorted(
+                (dict(attack) for attack in self.active_attacks.values()),
+                key=lambda item: item.get("last_seen", 0),
+                reverse=True,
             )
 
-        self._emit_hosts_update()
+        serialized = []
+        for attack in attacks:
+            serialized.append(
+                {
+                    "timestamp": self._format_event_timestamp(attack.get("last_seen"), include_date=False),
+                    "type": attack.get("type", "Unknown"),
+                    "attacker": attack.get("attacker", "unknown"),
+                    "victim": attack.get("victim", "unknown"),
+                    "attacker_mac": attack.get("attacker_mac") or "unknown",
+                    "victim_mac": attack.get("victim_mac") or "unknown",
+                    "severity": attack.get("severity", "suspicious"),
+                    "status": attack.get("status", "active"),
+                    "count": attack.get("count", 1),
+                }
+            )
+        return serialized
 
-    def _initialize_mikrotik(self, selected_interface):
-        config = resolve_mikrotik_config(selected_interface=selected_interface, parent=self.window)
-        if not config:
-            self.mikrotik_config = None
-            self.mikrotik = None
-            logging.error("MikroTik connection failed or not initialized")
+    def _serialize_event_history(self):
+        with self.security_event_lock:
+            events = list(self.event_history)
+
+        serialized = []
+        for event in reversed(events):
+            serialized.append(
+                {
+                    "timestamp": self._format_event_timestamp(event.get("timestamp")),
+                    "type": event.get("type", "Unknown"),
+                    "attacker": event.get("attacker", "unknown"),
+                    "victim": event.get("victim", "unknown"),
+                    "status": event.get("status", "unknown"),
+                }
+            )
+        return serialized
+
+    def _refresh_security_tables(self):
+        self.security_update_pending = False
+        if self.packet_view is not None:
+            self.packet_view.update_active_alerts(self._serialize_active_attacks())
+            self.packet_view.update_event_history(self._serialize_event_history())
+
+    def _schedule_security_refresh(self):
+        if self.security_update_pending:
+            return
+        self.security_update_pending = True
+        try:
+            self.root.after(200, self._refresh_security_tables)
+        except tk.TclError:
+            self.security_update_pending = False
+
+    def _record_event_history(self, attack_type, attacker_ip=None, victim_ip=None, status="Detected"):
+        with self.security_event_lock:
+            self.event_history.append(
+                {
+                    "timestamp": time.time(),
+                    "type": self._normalize_attack_type(attack_type),
+                    "attacker": str(attacker_ip or "unknown").strip(),
+                    "victim": str(victim_ip or "unknown").strip(),
+                    "status": status,
+                }
+            )
+
+    def _upsert_attack_event(
+        self,
+        attack_type,
+        attacker_ip=None,
+        victim_ip=None,
+        status="active",
+        attacker_mac=None,
+        victim_mac=None,
+        add_history=True,
+    ):
+        normalized_attack = self._normalize_attack_type(attack_type)
+        normalized_attacker = str(attacker_ip or "unknown").strip()
+        normalized_victim = str(victim_ip or "unknown").strip()
+        if normalized_attacker == "unknown" and normalized_victim == "unknown":
             return
 
-        self.mikrotik_config = config
-        self.mikrotik = MikroTikManager(
-            host=config.host,
-            username=config.username,
-            password=config.password,
-            port=config.port,
-        )
-        self.mikrotik_ip = config.host
-        self.mikrotik.connect()
+        now = time.time()
+        key = self._attack_key(normalized_attack, normalized_attacker, normalized_victim)
+        attacker_mac = attacker_mac or self._get_host_mac(normalized_attacker)
+        victim_mac = victim_mac or self._get_host_mac(normalized_victim)
 
-        if not self.mikrotik.is_connected():
-            logging.error("MikroTik connection failed or not initialized")
-
-    def _normalize_ip(self, ip_address):
-        if ip_address is None:
-            return None
-        value = str(ip_address).strip()
-        return value or None
-
-    def _normalize_mac(self, mac_address):
-        if mac_address is None:
-            return None
-        value = str(mac_address).strip().lower()
-        return value or None
-
-    def _is_valid_mac(self, mac_address):
-        normalized = self._normalize_mac(mac_address)
-        if not normalized:
-            return False
-        parts = normalized.split(":")
-        return len(parts) == 6 and all(len(part) == 2 for part in parts)
-
-    def _get_gateway_ips(self, selected_interfaces=None):
-        gateway_ips = set()
-
-        for context in self.detection_engine.attack_contexts.values():
-            for candidate in [context.get("gateway_ip"), context.get("spoofed_ip")]:
-                normalized_candidate = self._normalize_ip(candidate)
-                if not normalized_candidate:
-                    continue
-                if not self._is_in_local_networks(normalized_candidate):
-                    continue
-                if normalized_candidate not in self.detection_engine.arp_baseline:
-                    continue
-                gateway_ips.add(normalized_candidate)
-
-        return gateway_ips
-
-    def _resolve_local_ip(self, selected_interface):
-        local_ip = None
-
-        try:
-            if self.network_capture and selected_interface:
-                local_ip = self.network_capture.get_interface_ip(selected_interface)
-        except Exception as error:
-            logging.debug("No se pudo resolver IP local por interfaz: %s", error)
-
-        if not local_ip:
-            try:
-                local_ip = socket.gethostbyname(socket.gethostname())
-            except Exception:
-                local_ip = None
-
-        return local_ip
-
-    def _resolve_local_mac(self, selected_interface):
-        if not selected_interface:
-            return None
-
-        try:
-            return self._normalize_mac(get_if_hwaddr(selected_interface))
-        except Exception as error:
-            logging.debug("No se pudo resolver MAC local de %s: %s", selected_interface, error)
-            return None
-
-    def _resolve_known_mac(self, ip_address):
-        if not ip_address:
-            return None
-
-        host_record = self._get_host_record(ip_address)
-        mac_address = self.detection_engine.arp_baseline.get(ip_address) or host_record.get("mac") or self.window.get_mac_for_ip(ip_address)
-        mac_address = self._normalize_mac(mac_address)
-        if mac_address:
-            return mac_address
-
-        try:
-            return self._normalize_mac(getmacbyip(ip_address))
-        except Exception as error:
-            logging.debug("No se pudo resolver MAC para %s: %s", ip_address, error)
-            return None
-
-    def _resolve_interface_for_ip(self, ip_address, preferred_interface=None):
-        if preferred_interface:
-            return preferred_interface
-
-        host_record = self._get_host_record(ip_address) if ip_address else {}
-        interfaces = sorted(host_record.get("interfaces", set()))
-        if interfaces:
-            return interfaces[0]
-
-        selected_interfaces = self.window.get_selected_capture_interfaces()
-        if selected_interfaces:
-            return selected_interfaces[0]
-
-        return self.network_capture.interface
-
-    def _build_restoration_context(self, attacker_ip, attacker_mac):
-        attack_context = self.detection_engine.get_attack_context(attacker_ip, attacker_mac) or {}
-        spoofed_ip = self._normalize_ip(attack_context.get("spoofed_ip"))
-        target_ip = self._normalize_ip(attack_context.get("target_ip"))
-        victim_ip = self._normalize_ip(attack_context.get("victim_ip"))
-        gateway_ip = self._normalize_ip(attack_context.get("gateway_ip"))
-        attacker_ip = self._normalize_ip(attacker_ip) or self._normalize_ip(attack_context.get("attacker_ip"))
-        interface_name = attack_context.get("interface")
-
-        gateway_candidates = [
-            self._normalize_ip(candidate)
-            for candidate in [gateway_ip, spoofed_ip]
-            if self._normalize_ip(candidate)
-        ]
-        gateway_ip = next(
-            (
-                candidate
-                for candidate in gateway_candidates
-                if self._is_in_local_networks(candidate) and candidate in self.detection_engine.arp_baseline
-            ),
-            None,
-        )
-        if not gateway_ip and spoofed_ip and self._is_in_local_networks(spoofed_ip):
-            gateway_ip = spoofed_ip
-
-        victim_candidates = [
-            self._normalize_ip(candidate)
-            for candidate in [target_ip, victim_ip]
-            if self._normalize_ip(candidate)
-        ]
-        victim_ip = next(
-            (
-                candidate
-                for candidate in victim_candidates
-                if (
-                    self._is_in_local_networks(candidate)
-                    and candidate in self.detection_engine.arp_baseline
-                    and candidate != attacker_ip
-                    and candidate != gateway_ip
-                )
-            ),
-            None,
-        )
-        if not victim_ip and target_ip and self._is_in_local_networks(target_ip) and target_ip != attacker_ip:
-            victim_ip = target_ip
-
-        victim_record = self._get_host_record(victim_ip) if victim_ip else {}
-        gateway_record = self._get_host_record(gateway_ip) if gateway_ip else {}
-
-        victim_mac = (
-            self._normalize_mac(self.detection_engine.arp_baseline.get(victim_ip))
-            or self._normalize_mac(self.detection_engine.arp_table.get(victim_ip))
-            or self._normalize_mac(victim_record.get("mac"))
-        )
-        gateway_mac = (
-            self._normalize_mac(self.detection_engine.arp_baseline.get(gateway_ip))
-            or self._normalize_mac(self.detection_engine.arp_table.get(gateway_ip))
-            or self._normalize_mac(gateway_record.get("mac"))
-        )
-
-        if not interface_name:
-            victim_interfaces = sorted(victim_record.get("interfaces", set()))
-            gateway_interfaces = sorted(gateway_record.get("interfaces", set()))
-            interface_name = victim_interfaces[0] if victim_interfaces else None
-            if not interface_name and gateway_interfaces:
-                interface_name = gateway_interfaces[0]
-            if not interface_name:
-                interface_name = self._resolve_interface_for_ip(victim_ip or gateway_ip)
-
-        context = {
-            "attacker_ip": attacker_ip or attack_context.get("attacker_ip"),
-            "attacker_mac": self._normalize_mac(attacker_mac) or self._normalize_mac(attack_context.get("attacker_mac")),
-            "victim_ip": victim_ip,
-            "victim_mac": victim_mac,
-            "gateway_ip": gateway_ip,
-            "gateway_mac": gateway_mac,
-            "spoofed_ip": spoofed_ip,
-            "target_ip": target_ip,
-            "interface": interface_name,
-        }
-        logging.debug(
-            "[ARP CONTEXT] attacker_ip=%s victim_ip=%s gateway_ip=%s victim_mac=%s gateway_mac=%s interface=%s",
-            context.get("attacker_ip"),
-            context.get("victim_ip"),
-            context.get("gateway_ip"),
-            context.get("victim_mac"),
-            context.get("gateway_mac"),
-            context.get("interface"),
-        )
-        return context
-
-    def _restore_victim_connectivity(self, attacker_ip, attacker_mac):
-        attack_context = self._build_restoration_context(attacker_ip, attacker_mac)
-        victim_ip = self._normalize_ip(attack_context.get("victim_ip"))
-        victim_mac = self._normalize_mac(attack_context.get("victim_mac"))
-        gateway_ip = self._normalize_ip(attack_context.get("gateway_ip"))
-        gateway_mac = self._normalize_mac(attack_context.get("gateway_mac"))
-        interface_name = attack_context.get("interface")
-        attacker_ip = self._normalize_ip(attack_context.get("attacker_ip"))
-
-        if not all([attacker_ip, victim_ip, gateway_ip, victim_mac, gateway_mac, interface_name]):
-            missing_fields = [
-                field_name
-                for field_name, field_value in {
-                    "attacker_ip": attacker_ip,
-                    "victim_ip": victim_ip,
-                    "gateway_ip": gateway_ip,
+        with self.security_event_lock:
+            existing = self.active_attacks.get(key)
+            if existing is None:
+                for existing_key, candidate in self.active_attacks.items():
+                    same_attacker = candidate.get("attacker") == normalized_attacker
+                    same_type = candidate.get("type") == normalized_attack
+                    candidate_victim = str(candidate.get("victim") or "unknown").strip()
+                    victim_matches = candidate_victim in {"unknown", normalized_victim} or normalized_victim == "unknown"
+                    if same_attacker and same_type and victim_matches:
+                        key = existing_key
+                        existing = candidate
+                        if candidate_victim == "unknown" and normalized_victim != "unknown":
+                            existing["victim"] = normalized_victim
+                        break
+            previous_status = existing.get("status") if existing else None
+            if existing is None:
+                self.active_attacks[key] = {
+                    "type": normalized_attack,
+                    "attacker": normalized_attacker,
+                    "victim": normalized_victim,
+                    "attacker_mac": attacker_mac,
                     "victim_mac": victim_mac,
-                    "gateway_mac": gateway_mac,
-                    "interface": interface_name,
-                }.items()
-                if not field_value
-            ]
-            logging.warning(
-                "ARP restoration skipped: incomplete context missing=%s context=%s",
-                ",".join(missing_fields),
-                attack_context,
-            )
-            return False
+                    "severity": self._severity_for_attack(normalized_attack),
+                    "status": status,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "count": 1,
+                }
+            else:
+                existing["last_seen"] = now
+                existing["status"] = status
+                existing["count"] = int(existing.get("count", 1)) + 1
+                existing["attacker_mac"] = attacker_mac or existing.get("attacker_mac")
+                existing["victim_mac"] = victim_mac or existing.get("victim_mac")
 
-        if victim_ip == attacker_ip or victim_ip == gateway_ip or victim_ip in self.blocked_ips:
-            logging.warning("ARP restoration skipped: invalid victim target %s", victim_ip)
-            return False
+            if add_history and (existing is None or previous_status != status):
+                self._record_event_history(normalized_attack, normalized_attacker, normalized_victim, status.title())
 
-        if not self._is_in_local_networks(victim_ip) or not self._is_in_local_networks(gateway_ip):
-            logging.error(
-                "ARP restoration skipped: cross-network context victim=%s gateway=%s attacker=%s",
-                victim_ip,
-                gateway_ip,
-                attacker_ip,
-            )
-            return False
+        self._schedule_security_refresh()
 
-        if not self._share_local_network(victim_ip, gateway_ip, attacker_ip):
-            logging.error(
-                "ARP restoration skipped: no shared subnet victim=%s gateway=%s attacker=%s",
-                victim_ip,
-                gateway_ip,
-                attacker_ip,
-            )
-            return False
-
-        print("[DEBUG] Victim:", victim_ip)
-        print("[DEBUG] Gateway:", gateway_ip)
-        print("[DEBUG] Attacker:", attacker_ip)
-        print("[DEBUG] Gateway MAC:", gateway_mac)
-        print("[DEBUG] Victim MAC:", victim_mac)
-        logging.debug("[ARP CONTEXT] attacker_ip=%s victim_ip=%s gateway_ip=%s", attacker_ip, victim_ip, gateway_ip)
-        logging.debug(
-            "[DEBUG] ARP restore: %s <- %s (%s)",
-            victim_ip,
-            gateway_ip,
-            gateway_mac,
-        )
-        logging.debug(
-            "[DEBUG] ARP restore: %s <- %s (%s)",
-            gateway_ip,
-            victim_ip,
-            victim_mac,
-        )
-
-        logging.info(
-            "[ARP] Restoring ARP for victim %s through %s on %s",
-            victim_ip,
-            gateway_ip,
-            interface_name,
-        )
-
-        if not self._is_valid_mac(victim_mac) or not self._is_valid_mac(gateway_mac):
-            logging.warning(
-                "ARP restoration skipped due to invalid MACs victim=%s gateway=%s",
-                victim_mac,
-                gateway_mac,
-            )
-            return False
-
-        restored = self.detection_engine.activate_post_block_mitigation(attack_context)
-        if restored:
-            log_event(f"ARP restored for victim {victim_ip}", "info")
-        else:
-            logging.warning("ARP restoration failed for victim %s", victim_ip)
-        return restored
-
-    def _refresh_protection_lists(self, selected_interfaces=None):
-        selected_interfaces = [iface for iface in (selected_interfaces or self.window.get_selected_capture_interfaces()) if iface]
-        primary_interface = selected_interfaces[0] if selected_interfaces else self.window.get_selected_capture_interface()
-        self.local_networks = [
-            network
-            for network in (
-                self.network_capture.get_interface_network(interface_name)
-                for interface_name in selected_interfaces
-            )
-            if network
-        ]
-
-        self.gateway_ips = {
-            self._normalize_ip(ip_address)
-            for ip_address in self._get_gateway_ips(selected_interfaces)
-            if self._normalize_ip(ip_address)
-        }
-        self.gateway_ip = sorted(self.gateway_ips)[0] if self.gateway_ips else None
-        self.local_interface_ips = {
-            self._normalize_ip(self._resolve_local_ip(interface_name))
-            for interface_name in selected_interfaces
-            if self._normalize_ip(self._resolve_local_ip(interface_name))
-        }
-        self.own_host_ip = self._normalize_ip(self._resolve_local_ip(primary_interface))
-        self.own_host_mac = self._normalize_mac(self._resolve_local_mac(primary_interface))
-        self.mikrotik_ip = self._normalize_ip(self.mikrotik.host if self.mikrotik else (self.mikrotik_config.host if self.mikrotik_config else None))
-
-        protected_ips = {
-            ip
-            for ip in self.gateway_ips.union(self.local_interface_ips).union({self.mikrotik_ip})
-            if ip
-        }
-        protected_macs = {
-            mac
-            for mac in {
-                self.own_host_mac,
-                *[self._resolve_known_mac(gateway_ip) for gateway_ip in self.gateway_ips],
-                self._resolve_known_mac(self.mikrotik_ip),
-            }
-            if mac
-        }
-
-        self.protected_ips = protected_ips
-        self.protected_macs = protected_macs
-
-        self.detection_engine.set_whitelist(self.protected_ips)
-        self.detection_engine.set_mac_whitelist(self.protected_macs)
-        self.detection_engine.set_local_networks(self.local_networks)
-
-        if self.mikrotik:
-            self.mikrotik.set_protected_hosts(self.protected_ips, self.protected_macs)
-
-        logging.info(
-            "Proteccion actualizada: ips=%s macs=%s",
-            sorted(self.protected_ips),
-            sorted(self.protected_macs),
-        )
-
-        if DEBUG:
-            log_debug(f"Selected interface: {', '.join(selected_interfaces) if selected_interfaces else 'default'}")
-            log_debug(
-                f"Local networks: {', '.join(str(network) for network in self.local_networks) if self.local_networks else 'unknown'}"
-            )
-            log_debug(f"Gateways: {', '.join(sorted(self.gateway_ips)) if self.gateway_ips else 'unknown'}")
-            log_debug(f"Local interface IPs: {', '.join(sorted(self.local_interface_ips)) if self.local_interface_ips else 'unknown'}")
-            log_debug(f"MikroTik IP: {self.mikrotik_ip or 'unknown'}")
-
-    def _is_in_local_networks(self, ip_address):
-        normalized_ip = self._normalize_ip(ip_address)
+    def _mark_attack_resolved(self, attacker_ip, status="Resolved"):
+        normalized_ip = str(attacker_ip).strip() if attacker_ip else None
         if not normalized_ip:
-            return False
+            return
 
+        with self.security_event_lock:
+            for attack in self.active_attacks.values():
+                if attack.get("attacker") == normalized_ip:
+                    attack["status"] = status.lower()
+                    attack["last_seen"] = time.time()
+                    self._record_event_history(attack.get("type"), normalized_ip, attack.get("victim"), status)
+
+        self._schedule_security_refresh()
+
+    def _expire_inactive_attacks(self):
+        now = time.time()
+        changed = False
+        with self.security_event_lock:
+            for attack in self.active_attacks.values():
+                status = str(attack.get("status", "")).lower()
+                if status in {"resolved", "unblocked", "block failed"}:
+                    continue
+                if now - float(attack.get("last_seen", now)) < self.ATTACK_RESOLVE_TIMEOUT_S:
+                    continue
+                attack["status"] = "resolved"
+                attack["last_seen"] = now
+                self._record_event_history(attack.get("type"), attack.get("attacker"), attack.get("victim"), "Resolved")
+                changed = True
+
+        if changed:
+            self._schedule_security_refresh()
+
+    def _format_host_status_label(self, host):
+        status = str(host.get("status", "active")).strip().lower()
+        if bool(host.get("is_blocked", False)):
+            block_type = str(host.get("block_type") or "").strip().lower()
+            attack_type = str(host.get("attack_type") or "").strip()
+            if block_type == "manual":
+                return "Blocked (Manual)"
+            if attack_type:
+                return f"Blocked ({attack_type})"
+            return "Blocked"
+        if status == "suspicious":
+            return "Suspicious"
+        return "Active"
+
+    def _resolve_host_state(self, existing=None, status=None, attack_type=None, clear_block=False):
+        existing = existing or {}
+        existing_status = str(existing.get("status", "active")).strip().lower() or "active"
+        existing_attack_type = existing.get("attack_type")
+        existing_is_blocked = bool(existing.get("is_blocked", False))
+        existing_block_type = existing.get("block_type")
+
+        next_status = str(status or existing_status or "active").strip().lower()
+        next_attack_type = attack_type if attack_type is not None else existing_attack_type
+
+        if clear_block:
+            return next_status, next_attack_type, False, None
+
+        if next_status == "blocked":
+            next_is_blocked = True
+            next_block_type = "manual" if str(next_attack_type or "").strip().lower() == "manual" else "auto"
+            return next_status, next_attack_type, next_is_blocked, next_block_type
+
+        if existing_is_blocked and next_status in {"active", "suspicious"}:
+            preserved_attack_type = next_attack_type if next_attack_type is not None else existing_attack_type
+            preserved_block_type = existing_block_type or (
+                "manual" if str(preserved_attack_type or "").strip().lower() == "manual" else "auto"
+            )
+            return "blocked", preserved_attack_type, True, preserved_block_type
+
+        if next_status == "active" and attack_type is None:
+            next_attack_type = None
+
+        return next_status, next_attack_type, False, None
+
+    def _upsert_host(self, ip_address, mac_address=None, status=None, attack_type=None):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return
+
+        normalized_mac = str(mac_address).strip().lower() if mac_address else None
+        now = time.time()
+
+        with self.host_lock:
+            existing = self.hosts.get(normalized_ip)
+            if existing is None:
+                next_status, next_attack_type, next_is_blocked, next_block_type = self._resolve_host_state(
+                    None,
+                    status=status,
+                    attack_type=attack_type,
+                )
+                self.hosts[normalized_ip] = {
+                    "ip": normalized_ip,
+                    "mac": normalized_mac or "unknown",
+                    "status": next_status,
+                    "is_blocked": next_is_blocked,
+                    "block_type": next_block_type,
+                    "attack_type": next_attack_type,
+                    "last_seen": now,
+                }
+                logging.info("[HOST] New host detected: %s", normalized_ip)
+            else:
+                next_status, next_attack_type, next_is_blocked, next_block_type = self._resolve_host_state(
+                    existing,
+                    status=status,
+                    attack_type=attack_type,
+                )
+                existing["mac"] = normalized_mac or existing.get("mac") or "unknown"
+                existing["status"] = next_status
+                existing["is_blocked"] = next_is_blocked
+                existing["block_type"] = next_block_type
+                existing["attack_type"] = next_attack_type
+                existing["last_seen"] = now
+                logging.info("[HOST] Updated host: %s status=%s", normalized_ip, existing["status"])
+
+        self._schedule_hosts_refresh()
+
+    def _set_host_status(self, ip_address, status, attack_type=None, clear_block=False):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return
+
+        with self.host_lock:
+            existing = self.hosts.get(normalized_ip)
+            if existing is None:
+                next_status, next_attack_type, next_is_blocked, next_block_type = self._resolve_host_state(
+                    None,
+                    status=status,
+                    attack_type=attack_type,
+                    clear_block=clear_block,
+                )
+                self.hosts[normalized_ip] = {
+                    "ip": normalized_ip,
+                    "mac": "unknown",
+                    "status": next_status,
+                    "is_blocked": next_is_blocked,
+                    "block_type": next_block_type,
+                    "attack_type": next_attack_type,
+                    "last_seen": time.time(),
+                }
+                logging.info("[HOST] New host detected: %s", normalized_ip)
+            else:
+                next_status, next_attack_type, next_is_blocked, next_block_type = self._resolve_host_state(
+                    existing,
+                    status=status,
+                    attack_type=attack_type,
+                    clear_block=clear_block,
+                )
+                existing["status"] = next_status
+                existing["is_blocked"] = next_is_blocked
+                existing["block_type"] = next_block_type
+                existing["attack_type"] = next_attack_type
+                existing["last_seen"] = time.time()
+                logging.info("[HOST] Updated host: %s status=%s blocked=%s", normalized_ip, next_status, next_is_blocked)
+
+        self._schedule_hosts_refresh()
+
+    def _parse_alert_message(self, message):
+        details = self._parse_alert_details(message)
+        return details.get("attack_type"), details.get("attacker_ip"), details.get("victim_ip")
+
+    def _parse_alert_details(self, message):
+        attack_type = None
+        attacker_ip = None
+        victim_ip = None
+        spoofed_ip = None
+        attacker_mac = None
+        victim_mac = None
+
+        lines = [line.strip() for line in str(message).splitlines() if line.strip()]
+        upper_message = str(message).upper()
+        if "ARP SPOOFING DETECTED" in upper_message:
+            attack_type = "ARP"
+        elif "PORT SCAN" in upper_message:
+            attack_type = "PORT_SCAN"
+        elif "DOS" in upper_message:
+            attack_type = "DoS"
+
+        for line in lines:
+            upper_line = line.upper()
+            if upper_line.startswith("ATTACKER IP:"):
+                attacker_ip = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("VICTIM IP:"):
+                victim_ip = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("TARGET IP:") and not victim_ip:
+                victim_ip = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("SPOOFED IP:"):
+                spoofed_ip = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("IP ATACANTE POSIBLE:") and not attacker_ip:
+                attacker_ip = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("ATTACKER MAC:"):
+                attacker_mac = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("VICTIM MAC:"):
+                victim_mac = line.split(":", 1)[1].strip()
+            elif upper_line.startswith("ATTACK TYPE:") and not attack_type:
+                attack_type = line.split(":", 1)[1].strip()
+
+        if attack_type == "ARP" and not attacker_ip:
+            attacker_ip = spoofed_ip
+
+        return {
+            "attack_type": attack_type,
+            "attacker_ip": attacker_ip,
+            "victim_ip": victim_ip,
+            "attacker_mac": attacker_mac,
+            "victim_mac": victim_mac,
+        }
+
+    def _is_invalid_host_ip(self, ip_address):
         try:
-            candidate = ipaddress.ip_address(normalized_ip)
+            candidate = ipaddress.ip_address(str(ip_address).strip())
         except ValueError:
-            return False
-
-        if not self.local_networks:
-            return candidate.is_private
-
-        return any(candidate in network for network in self.local_networks)
-
-    def _share_local_network(self, *ip_addresses):
-        normalized_values = [self._normalize_ip(value) for value in ip_addresses if self._normalize_ip(value)]
-        if not normalized_values:
-            return False
-
-        try:
-            candidates = [ipaddress.ip_address(value) for value in normalized_values]
-        except ValueError:
-            return False
-
-        if not self.local_networks:
-            return all(candidate.is_private for candidate in candidates)
-
-        return any(all(candidate in network for candidate in candidates) for network in self.local_networks)
-
-    def is_valid_attacker(self, ip_address, mac_address):
-        normalized_ip = self._normalize_ip(ip_address)
-        normalized_mac = self._normalize_mac(mac_address)
-
-        if not normalized_ip:
-            logging.warning("Skipping attacker validation with empty IP")
-            return False
-
-        if normalized_ip == "255.255.255.255":
-            logging.warning("Skipping broadcast address candidate: %s", normalized_ip)
-            return False
-
-        if normalized_ip in self.gateway_ips:
-            print("[WARNING] Skipping gateway, not attacker")
-            logging.warning("Skipping gateway IP: %s", normalized_ip)
-            return False
-
-        if normalized_ip in self.protected_ips:
-            logging.warning("Skipping protected host: %s", normalized_ip)
-            return False
-
-        try:
-            candidate = ipaddress.ip_address(normalized_ip)
-        except ValueError:
-            logging.warning("Skipping invalid IP candidate: %s", normalized_ip)
-            return False
-
-        if not self._is_in_local_networks(normalized_ip):
-            print("[DEBUG] Skipping external IP:", normalized_ip)
-            logging.info("Skipping external IP outside local networks: %s", normalized_ip)
-            return False
-
-        if any(
-            [
-                candidate.is_multicast,
-                candidate.is_loopback,
-                candidate.is_unspecified,
-                candidate.is_link_local,
-                candidate.is_reserved,
-            ]
-        ):
-            logging.warning("Skipping non-routable or reserved IP: %s", normalized_ip)
-            return False
-
-        if normalized_ip in self.blocked_ips:
-            logging.info("Skipping already blocked IP: %s", normalized_ip)
-            return False
-
-        if normalized_mac and normalized_mac in self.protected_macs:
-            logging.warning("Skipping protected MAC: %s", normalized_mac)
-            return False
-
-        return True
-
-    def _resolve_attacker_identity(self, attacker_ip, attacker_mac):
-        normalized_ip = self._normalize_ip(attacker_ip)
-        normalized_mac = self._normalize_mac(attacker_mac)
-        if self.is_valid_attacker(normalized_ip, normalized_mac):
-            return normalized_ip, normalized_mac
-        return None, normalized_mac
-
-    def handle_packet(self, packet):
-        self.window.packet_count += 1
-        self._register_packet_host(packet)
-        self.detection_engine.process_packet(packet)
-        self._queue_ui_task("packet_summary", packet.summary())
-
-    def handle_alert(self, message):
-        self._queue_ui_task("alert", message)
-
-    def remove_mikrotik_rules(self, ip_address, mac_address=None):
-        normalized_ip = self._normalize_ip(ip_address)
-        normalized_mac = self._normalize_mac(mac_address)
-        if not normalized_ip:
-            return False
-
-        if not self.mikrotik or not self.mikrotik.is_connected():
-            logging.error("MikroTik connection failed or not initialized")
-            return False
-
-        return bool(self.mikrotik.unblock_ip(normalized_ip, normalized_mac))
-
-    def process_ui_queue(self):
-        packet_summaries = []
-        pending_hosts = None
-        alerts = []
-        cleared_alert_ips = []
-
-        while not self.ui_queue.empty():
-            try:
-                task = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            task_type = task.get("type")
-            task_data = task.get("data")
-            if task_type == "update_devices":
-                pending_hosts = task_data
-            elif task_type == "packet_summary":
-                packet_summaries.append(task_data)
-            elif task_type == "alert":
-                alerts.append(task_data)
-            elif task_type == "remove_alerts":
-                cleared_alert_ips.append(task_data)
-
-        for summary in packet_summaries[:30]:
-            self.window.update_packet_display(summary)
-
-        for ip_address in cleared_alert_ips:
-            self.window.remove_alerts_for_ip(ip_address)
-
-        for message in alerts:
-            self.window.update_anomaly_display(message)
-
-        if pending_hosts is not None:
-            self.window.update_hosts_display(pending_hosts)
-
-    def start_capture(self, selected_interfaces):
-        if not selected_interfaces:
-            logging.error("No hay interfaces seleccionadas para iniciar la captura")
-            return False
-
-        if len(selected_interfaces) > 2:
-            logging.error("La captura dual admite como maximo dos interfaces")
-            return False
-
-        primary_interface = self._get_primary_interface(selected_interfaces)
-        self.network_capture.set_interfaces(selected_interfaces)
-        self.detection_engine.set_capture_interface(primary_interface)
-        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
-
-        self._initialize_mikrotik(primary_interface)
-        self._refresh_protection_lists(selected_interfaces)
-        self.detection_engine.build_arp_baseline()
-
-        started = self.network_capture.start_capture_thread(selected_interfaces)
-        if started:
-            logging.info("Captura iniciada en interfaces: %s", ", ".join(selected_interfaces))
-        else:
-            logging.error("No se pudo iniciar la captura en las interfaces seleccionadas")
-        return started
-
-    def pause_capture(self):
-        self.network_capture.pause_capture()
-
-    def continue_capture(self):
-        self.network_capture.resume_capture()
-
-    def stop_capture(self):
-        self.network_capture.stop_capture()
-
-    def find_hosts(self):
-        selected_interfaces = self.window.get_selected_capture_interfaces()
-        if selected_interfaces:
-            self.network_capture.set_interfaces(selected_interfaces)
-        self.network_capture.find_hosts()
-
-    def block_attacker_connection(self, attacker_ip, attacker_mac=None, attack_type="Unknown"):
-        normalized_ip = self._normalize_ip(attacker_ip)
-        normalized_mac = self._normalize_mac(attacker_mac)
-        attack_context = self.detection_engine.get_attack_context(normalized_ip or attacker_ip, attacker_mac) or {}
-
-        log_debug(
-            f"[BLOCK FLOW] Request to block attacker={normalized_ip or attacker_ip or 'unknown'} "
-            f"mac={normalized_mac or 'unknown'} attack_type={attack_type}"
-        )
-        log_debug(
-            f"[ATTACK TYPE] Blocking {normalized_ip or attacker_ip or 'unknown'} as {attack_type}"
-        )
-
-        if not normalized_ip:
-            logging.error("[BLOCK] Invalid attacker IP received: %s", attacker_ip)
-            return False
-
-        host_record = self._get_host_record(normalized_ip)
-        self._upsert_host_record(
-            normalized_ip,
-            normalized_mac or host_record.get("mac"),
-            interface_name=", ".join(sorted(host_record.get("interfaces", set()))) if host_record else None,
-            status="attacker",
-            activity=attack_type,
-            attack_type=attack_type,
-        )
-
-        if self.mikrotik and not self.mikrotik.is_connected():
-            try:
-                self.mikrotik.connect()
-            except Exception as error:
-                logging.error("[BLOCK] Exception while connecting MikroTik for %s: %s", normalized_ip, error)
-                return False
-
-        if not self.mikrotik or not self.mikrotik.is_connected():
-            logging.error("[BLOCK] MikroTik connection failed or not initialized for %s", normalized_ip)
-            return False
-
-        try:
-            result = self.mikrotik.block_attacker(normalized_ip, normalized_mac, attack_type=attack_type)
-            log_debug(f"[BLOCK FLOW] MikroTik block result attacker={normalized_ip} result={result!r}")
-        except TypeError:
-            try:
-                result = self.mikrotik.block_attacker(normalized_ip, normalized_mac)
-                log_debug(f"[BLOCK FLOW] MikroTik block result attacker={normalized_ip} result={result!r}")
-            except Exception as error:
-                logging.error("[BLOCK] Exception while blocking %s: %s", normalized_ip, error)
-                return False
-        except Exception as error:
-            logging.error("[BLOCK] Exception while blocking %s: %s", normalized_ip, error)
-            return False
-
-        if result:
-            self.blocked_ips.add(normalized_ip)
-            if normalized_mac:
-                self.blocked_macs.add(normalized_mac)
-
-            updated_record = self._get_host_record(normalized_ip)
-            self._upsert_host_record(
-                normalized_ip,
-                normalized_mac or updated_record.get("mac", "unknown"),
-                interface_name=", ".join(sorted(updated_record.get("interfaces", set()))) if updated_record else None,
-                status="blocked",
-                host_type=updated_record.get("type", "Host"),
-                activity=attack_type,
-                attack_type=attack_type,
-            )
-
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._queue_ui_task(
-                "alert",
-                "\n".join(
-                    [
-                        "[BLOCKED] Attacker blocked",
-                        f"Timestamp: {timestamp}",
-                        f"Attacker IP: {normalized_ip}",
-                        f"Attacker MAC: {normalized_mac or 'unknown'}",
-                        f"Attack Type: {attack_type}",
-                    ]
-                ),
-            )
-
-            logging.info("[BLOCK] Attacker %s blocked successfully as %s", normalized_ip, attack_type)
-            if attack_context:
-                time.sleep(1)
-                self._restore_victim_connectivity(normalized_ip, normalized_mac)
             return True
 
-        logging.error("[BLOCK] MikroTik failed to block %s as %s", normalized_ip, attack_type)
+        if candidate.version != 4:
+            return True
+        if any(
+            [
+                candidate.is_loopback,
+                candidate.is_multicast,
+                candidate.is_unspecified,
+                candidate.is_reserved,
+                candidate == ipaddress.IPv4Address("255.255.255.255"),
+            ]
+        ):
+            return True
+
+        with self.services_lock:
+            detection_service = self.detection_service
+        if detection_service is None:
+            return False
+
+        for network in getattr(detection_service.engine, "local_networks", []) or []:
+            if candidate == network.network_address or candidate == network.broadcast_address:
+                return True
+
         return False
 
-    def _legacy_unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
-        resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
-        target_ip = resolved_ip or self._normalize_ip(attacker_ip)
-        target_record = self._get_host_record(target_ip) if target_ip else {}
-        target_mac = resolved_mac or self._normalize_mac(attacker_mac) or target_record.get("mac")
-
-        if not target_ip:
-            logging.warning("No attacker IP available for MikroTik unblock")
+    def _handle_capture_startup_failure(self, startup_token, error_message):
+        if startup_token != self.startup_token:
             return
 
-        if self.detection_engine.is_attack_active(target_ip):
-            answer = QMessageBox.question(
-                self.window,
-                "Ataque activo",
-                "El dispositivo aún presenta un ataque en curso. ¿Desea continuar?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+        self.startup_in_progress = False
+        logging.error("[UI] Capture startup failed: %s", error_message)
+        messagebox.showerror("Capture startup error", error_message)
+        self.show_interface_selection()
+
+    def _cancel_startup(self):
+        if not self.startup_in_progress:
+            self.show_interface_selection()
+            return
+
+        logging.info("[UI] Startup cancelled by user")
+        self._cancel_connection_timeout()
+        self.startup_in_progress = False
+        self.startup_token += 1
+        self._reset_runtime_services()
+        if self.router_view is not None:
+            self.router_view.set_busy(False, "", keep_cancel_enabled=True)
+        self.show_interface_selection()
+
+    def _show_packet_view(self, startup_data):
+        interface_info = startup_data["interface"]
+        config = startup_data["config"]
+        set_active_mikrotik_config(config)
+
+        self.packet_view = PacketView(
+            self.container,
+            on_pause=self.pause_capture,
+            on_resume=self.resume_capture,
+            on_stop=self.stop_capture,
+            on_unblock_host=self.unblock_host,
+            on_block_host=self.block_host,
+        )
+        self.packet_view.set_interface(interface_info.name, startup_data["interface_ip"])
+        self.packet_view.set_mikrotik_status("Connecting...", connected=False)
+        self.packet_view.set_capture_status("Initializing...")
+        self.packet_view.append_log(
+            f"Preparing capture on {interface_info.name} ({interface_info.identifier})...",
+            level="info",
+        )
+        self.packet_view.update_hosts(self._serialize_hosts())
+        self.packet_view.update_active_alerts(self._serialize_active_attacks())
+        self.packet_view.update_event_history(self._serialize_event_history())
+        self._set_view(self.packet_view)
+
+    def handle_packet(self, packet):
+        try:
+            self.packet_pipeline_queue.put_nowait(packet)
+        except queue.Full:
+            self._rate_limited_warning("packet_queue_full", "[PIPELINE] Packet queue full; dropping packets to preserve real-time responsiveness")
+
+    def _track_packet_hosts(self, packet):
+        if packet.haslayer(ARP):
+            arp_ip = str(packet[ARP].psrc).strip() if getattr(packet[ARP], "psrc", None) else None
+            if arp_ip and not self._is_invalid_host_ip(arp_ip):
+                self._upsert_host(arp_ip, packet[ARP].hwsrc, status="active", attack_type=None)
+            return
+
+        if packet.haslayer(IP) and packet.haslayer(Ether):
+            src_ip = str(packet[IP].src).strip() if getattr(packet[IP], "src", None) else None
+            if src_ip and not self._is_invalid_host_ip(src_ip):
+                self._upsert_host(src_ip, packet[Ether].src, status="active", attack_type=None)
+
+    def handle_alert(self, message):
+        if not message:
+            return
+        upper_message = str(message).upper()
+        if "ARP SPOOFING DETECTED" in upper_message:
+            logging.warning("[IDS] ARP attack detected")
+        elif "DOS" in upper_message:
+            logging.warning("[IDS] DoS detected")
+        elif "PORT SCAN" in upper_message:
+            logging.warning("[IDS] Port scan detected")
+        alert_details = self._parse_alert_details(message)
+        attack_type = alert_details.get("attack_type")
+        attacker_ip = alert_details.get("attacker_ip")
+        victim_ip = alert_details.get("victim_ip")
+        attacker_mac = alert_details.get("attacker_mac")
+        victim_mac = alert_details.get("victim_mac")
+        if attacker_ip and attack_type:
+            self._set_host_status(attacker_ip, "suspicious", attack_type=attack_type)
+            self._upsert_attack_event(
+                attack_type,
+                attacker_ip=attacker_ip,
+                victim_ip=victim_ip,
+                status="active",
+                attacker_mac=attacker_mac,
+                victim_mac=victim_mac,
             )
-            if answer != QMessageBox.Yes:
-                return
-
-        if self.mikrotik and not self.mikrotik.is_connected():
-            self.mikrotik.connect()
-
-        if self.mikrotik and self.mikrotik.is_connected():
-            unblocked = self.mikrotik.unblock_ip(target_ip, target_mac)
+        if victim_ip:
+            self._set_host_status(victim_ip, "active", attack_type=None)
+        if attacker_ip or victim_ip:
+            log_message = (
+                f"{message}\n"
+                f"Correlation: attacker={attacker_ip or 'unknown'} victim={victim_ip or 'unknown'} "
+                f"victim_mac={victim_mac or self._get_host_mac(victim_ip) or 'unknown'}"
+            )
         else:
-            logging.error("MikroTik connection failed or not initialized")
-            return
+            log_message = message
+        self.ui_queue.put({"type": "log", "data": {"message": log_message, "level": self._infer_log_level(message)}})
 
-        if unblocked:
-            logging.debug("[DEBUG] Unblocking attacker %s", target_ip)
-            self.clear_mikrotik_connections(target_ip)
-            self.blocked_ips.discard(target_ip)
-            if target_mac:
-                self.blocked_macs.discard(target_mac)
-            self.detection_engine.reset_host_state(target_ip)
-            self._upsert_host_record(
-                target_ip,
-                target_mac or target_record.get("mac", "unknown"),
-                interface_name=", ".join(sorted(target_record.get("interfaces", set()))) if target_record else None,
-                status="trusted",
-                host_type=target_record.get("type", "Host"),
-                activity="Manual Unblock",
-            )
+    def _infer_log_level(self, message):
+        upper_message = str(message).upper()
+        if "[BLOCK" in upper_message or "[ALERT" in upper_message:
+            return "alert"
+        if "[WARNING" in upper_message:
+            return "warning"
+        if "[ERROR" in upper_message:
+            return "error"
+        return "info"
 
-            self._queue_ui_task(
-                "alert",
-                "\n".join(
-                    [
-                        "[UNBLOCKED] Host allowed again",
-                        f"Attacker IP: {target_ip}",
-                        f"Attacker MAC: {target_mac or 'unknown'}",
-                    ]
-                ),
-            )
-
-    def unblock_attacker_connection(self, attacker_ip, attacker_mac=None):
-        resolved_ip, resolved_mac = self._resolve_attacker_identity(attacker_ip, attacker_mac)
-        target_ip = resolved_ip or self._normalize_ip(attacker_ip)
-        target_record = self._get_host_record(target_ip) if target_ip else {}
-        target_mac = resolved_mac or self._normalize_mac(attacker_mac) or target_record.get("mac")
-
-        if not target_ip:
-            logging.warning("No attacker IP available for MikroTik unblock")
-            return
-
-        if self.detection_engine.is_attack_active(target_ip):
-            answer = QMessageBox.question(
-                self.window,
-                "Ataque activo",
-                "El dispositivo aun presenta un ataque en curso. Desea continuar?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
-
-        if self.mikrotik and not self.mikrotik.is_connected():
-            self.mikrotik.connect()
-
-        if not self.mikrotik or not self.mikrotik.is_connected():
-            logging.error("MikroTik connection failed or not initialized")
-            return
-
-        if not self.remove_mikrotik_rules(target_ip, target_mac):
-            return
-
-        logging.debug("[DEBUG] Unblocking attacker %s", target_ip)
-        self.clear_mikrotik_connections(target_ip)
-        self.blocked_ips.discard(target_ip)
-        if target_mac:
-            self.blocked_macs.discard(target_mac)
-        self.detection_engine.clear_attack_state(target_ip)
-        self.detection_engine.reset_host_state(target_ip)
-        self._upsert_host_record(
-            target_ip,
-            target_mac or target_record.get("mac", "unknown"),
-            interface_name=", ".join(sorted(target_record.get("interfaces", set()))) if target_record else None,
-            status="trusted",
-            host_type=target_record.get("type", "Host"),
-            activity="Manual Unblock",
-        )
-
-        self._queue_ui_task("remove_alerts", target_ip)
-        self._queue_ui_task(
-            "alert",
-            "\n".join(
-                [
-                    "[UNBLOCKED] Host allowed again",
-                    f"Attacker IP: {target_ip}",
-                    f"Attacker MAC: {target_mac or 'unknown'}",
-                ]
-            ),
-        )
-
-    def clear_mikrotik_connections(self, ip_address):
-        normalized_ip = self._normalize_ip(ip_address)
+    def block_attacker_connection(self, attacker_ip, attacker_mac=None, attack_type="Unknown"):
+        normalized_ip = str(attacker_ip).strip() if attacker_ip else None
         if not normalized_ip:
             return False
 
-        if not self.mikrotik or not self.mikrotik.is_connected():
-            logging.warning("[MIKROTIK CLEAN] ip=%s skipped=no_connection", normalized_ip)
+        normalized_mac = str(attacker_mac).strip().lower() if attacker_mac else None
+        if not normalized_mac:
+            with self.host_lock:
+                normalized_mac = self.hosts.get(normalized_ip, {}).get("mac")
+
+        with self.services_lock:
+            mikrotik_manager = self.mikrotik_manager
+
+        if mikrotik_manager is None:
+            self.ui_queue.put(
+                {
+                    "type": "log",
+                    "data": {
+                        "message": f"Router connection is not available. Could not block {normalized_ip}.",
+                        "level": "error",
+                    },
+                }
+            )
             return False
+
+        logging.warning("[BLOCK] Blocking attacker %s", normalized_ip)
+        self._set_host_status(normalized_ip, "suspicious", attack_type=attack_type)
+        self._upsert_attack_event(
+            attack_type,
+            attacker_ip=normalized_ip,
+            victim_ip=None,
+            status="queued",
+            attacker_mac=normalized_mac,
+        )
+        self._queue_mikrotik_action(
+            "block",
+            ip_address=normalized_ip,
+            mac_address=normalized_mac,
+            attack_type=attack_type,
+        )
+        return True
+
+    def block_host(self, ip_address):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return False
+
+        with self.services_lock:
+            mikrotik_manager = self.mikrotik_manager
+
+        if mikrotik_manager is None:
+            self._append_runtime_log(f"Could not block {normalized_ip}: router is not connected.", level="error")
+            return False
+
+        with self.host_lock:
+            host_entry = dict(self.hosts.get(normalized_ip, {}))
+        host_mac = host_entry.get("mac")
+        if host_mac == "unknown":
+            host_mac = None
+
+        self._set_host_status(normalized_ip, "blocked", attack_type="manual")
+        self._upsert_attack_event(
+            "Manual",
+            attacker_ip=normalized_ip,
+            victim_ip=None,
+            status="queued",
+            attacker_mac=host_mac,
+        )
+        self._queue_mikrotik_action(
+            "block",
+            ip_address=normalized_ip,
+            mac_address=host_mac,
+            attack_type="manual",
+        )
+        self._append_runtime_log(f"Manual block queued for {normalized_ip}.", level="warning")
+        return True
+
+    def pause_capture(self):
+        with self.services_lock:
+            capture_service = self.capture_service
+        if capture_service is not None:
+            capture_service.pause()
+            if self.packet_view is not None:
+                self.packet_view.set_capture_state(paused=True, stopped=False)
+                self.packet_view.append_log("Capture paused.", level="warning")
+
+    def resume_capture(self):
+        with self.services_lock:
+            capture_service = self.capture_service
+        if capture_service is not None:
+            capture_service.resume()
+            if self.packet_view is not None:
+                self.packet_view.set_capture_state(paused=False, stopped=False)
+                self.packet_view.append_log("Capture resumed.", level="info")
+
+    def stop_capture(self):
+        with self.services_lock:
+            capture_service = self.capture_service
+        if capture_service is not None:
+            capture_service.stop()
+        if self.packet_view is not None:
+            self.packet_view.set_capture_state(paused=False, stopped=True)
+            self.packet_view.append_log("Capture stopped safely.", level="warning")
+
+    def unblock_host(self, ip_address):
+        normalized_ip = str(ip_address).strip() if ip_address else None
+        if not normalized_ip:
+            return False
+
+        with self.services_lock:
+            mikrotik_manager = self.mikrotik_manager
+            detection_service = self.detection_service
+
+        if mikrotik_manager is None or not mikrotik_manager.is_connected():
+            self._append_runtime_log(f"Could not unblock {normalized_ip}: router is not connected.", level="error")
+            return False
+
+        with self.host_lock:
+            host_entry = dict(self.hosts.get(normalized_ip, {}))
+        host_mac = host_entry.get("mac")
+        if host_mac == "unknown":
+            host_mac = None
+
+        unblocked = self._run_mikrotik_action(
+            "unblock",
+            ip_address=normalized_ip,
+            mac_address=host_mac,
+        )
+        if not unblocked:
+            self._append_runtime_log(f"Failed to unblock {normalized_ip}.", level="error")
+            return False
+
+        if detection_service is not None:
+            detection_service.clear_attack_state(normalized_ip)
+            detection_service.reset_host_state(normalized_ip)
+
+        self._set_host_status(normalized_ip, "active", attack_type=None, clear_block=True)
+        self._mark_attack_resolved(normalized_ip, status="Unblocked")
+        self._record_event_history("Manual", normalized_ip, None, "Unblocked")
+        self._schedule_security_refresh()
+        self._append_runtime_log(f"Host {normalized_ip} was manually unblocked.", level="info")
+        return True
+
+    def process_ui_queue(self):
+        self._expire_inactive_attacks()
+        packet_batch = []
+        with self.packet_buffer_lock:
+            if self.packet_buffer:
+                packet_batch = self.packet_buffer[: self.packet_flush_limit]
+                del self.packet_buffer[: self.packet_flush_limit]
+
+        if self.packet_view is not None and packet_batch:
+            for packet_record in packet_batch:
+                self.packet_view.add_packet(packet_record)
 
         try:
-            cleaned = self.mikrotik.clear_connections(normalized_ip)
-            logging.info("[MIKROTIK CLEAN] ip=%s cleaned=%s", normalized_ip, cleaned)
-            if DEBUG:
-                log_debug(f"[MIKROTIK CLEAN] ip={normalized_ip}")
-            return bool(cleaned)
-        except Exception as error:
-            logging.error("[MIKROTIK CLEAN] ip=%s error=%s", normalized_ip, error)
-            return False
+            while True:
+                task = self.ui_queue.get_nowait()
+                task_type = task.get("type")
+                task_data = task.get("data")
 
-    def run(self):
-        self.detection_engine.configure_mitigation(**self.window.get_mitigation_options())
-        self.ui_poll_timer.start()
-        self.window.show()
+                if task_type == "log" and self.packet_view is not None:
+                    self.packet_view.append_log(task_data["message"], level=task_data.get("level", "info"))
+                elif task_type == "log":
+                    self.deferred_events.append(task)
+                elif task_type == "status" and self.packet_view is not None:
+                    text = task_data.get("text", "Disconnected")
+                    self.packet_view.set_mikrotik_status(text, connected=bool(task_data.get("connected")))
+                elif task_type == "status":
+                    self.deferred_events.append(task)
+        except queue.Empty:
+            pass
+
+        if self.packet_view is not None and self.deferred_events:
+            for deferred_task in self.deferred_events:
+                self.ui_queue.put(deferred_task)
+            self.deferred_events.clear()
+
+        try:
+            if self.root.winfo_exists():
+                self.root.after(200, self.process_ui_queue)
+        except tk.TclError:
+            return
+
+    def shutdown(self):
+        self._cancel_connection_timeout()
+        self.worker_stop_event.set()
+        with self.services_lock:
+            capture_service = self.capture_service
+            mikrotik_manager = self.mikrotik_manager
+
+        self._cleanup_services(capture_service=capture_service, mikrotik_manager=mikrotik_manager)
+        self.root.destroy()
 
 
 def main():
-    app = QApplication(sys.argv)
-    controller = AppController()
-    controller.run()
-    sys.exit(app.exec_())
+    root = tk.Tk()
+    AppController(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":

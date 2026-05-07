@@ -9,7 +9,7 @@ from scapy.all import ARP, Ether, sniff, srp
 from event_logger import log_debug
 
 
-DEBUG = True
+DEBUG = False
 
 
 class NetworkCaptureScanner:
@@ -53,6 +53,7 @@ class NetworkCaptureScanner:
         self.capture_threads = []
 
         for iface in self.interfaces:
+            logging.info("[CAPTURE] Starting sniff on interface: %s", iface)
             thread = threading.Thread(
                 target=self._capture_loop,
                 args=(iface,),
@@ -65,7 +66,7 @@ class NetworkCaptureScanner:
 
     def _capture_loop(self, interface_name):
         try:
-            logging.info("Iniciando captura en interfaz real: %s", interface_name)
+            logging.info("[CAPTURE] Iniciando captura en interfaz real: %s", interface_name)
             if DEBUG:
                 log_debug(f"Selected interface for capture: {interface_name}")
 
@@ -104,6 +105,11 @@ class NetworkCaptureScanner:
 
             if interface_name:
                 setattr(packet, "capture_interface", interface_name)
+            logging.debug(
+                "[CAPTURE] Packet received on %s summary=%s",
+                interface_name or "unknown",
+                packet.summary(),
+            )
             self.packet_callback(packet)
 
         except Exception as error:
@@ -164,6 +170,8 @@ class NetworkCaptureScanner:
 
                 for _sent, received in result:
                     ip_address = received.psrc
+                    if not self._is_valid_discovered_host(ip_address, local_ip):
+                        continue
                     host = merged_hosts.setdefault(
                         ip_address,
                         {
@@ -188,3 +196,32 @@ class NetworkCaptureScanner:
             self.hosts_callback(hosts)
         except Exception as error:
             logging.error("Error al buscar hosts en la red: %s", error)
+
+    def _is_valid_discovered_host(self, ip_address, local_ip=None):
+        try:
+            candidate = ipaddress.ip_address(str(ip_address).strip())
+        except ValueError:
+            return False
+
+        if candidate.version != 4:
+            return False
+        if any(
+            [
+                candidate.is_loopback,
+                candidate.is_multicast,
+                candidate.is_unspecified,
+                candidate.is_reserved,
+                candidate == ipaddress.IPv4Address("255.255.255.255"),
+            ]
+        ):
+            return False
+
+        if local_ip:
+            try:
+                local_network = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+                if candidate in {local_network.network_address, local_network.broadcast_address}:
+                    return False
+            except ValueError:
+                return True
+
+        return True

@@ -1,4 +1,4 @@
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 _gui_event_callback = None
 
