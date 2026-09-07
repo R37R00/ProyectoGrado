@@ -101,24 +101,42 @@ def resolve_capture_interface(interface_name):
         return None
 
     lookup = str(interface_name).strip().lower()
+
+    # 1. Priorizar coincidencia exacta con el nombre de la interfaz.
     for iface in conf.ifaces.values():
-        candidates = {
-            str(getattr(iface, "name", "")).strip(),
-            str(getattr(iface, "network_name", "")).strip(),
-            str(getattr(iface, "description", "")).strip(),
-        }
-        normalized_candidates = {value.lower() for value in candidates if value}
-        if lookup in normalized_candidates:
-            resolved_name = str(getattr(iface, "name", "")).strip() or str(interface_name).strip()
-            logging.info("[CAPTURE] Resolved interface '%s' -> '%s'", interface_name, resolved_name)
-            return resolved_name
-        if any(lookup in candidate or candidate in lookup for candidate in normalized_candidates):
-            resolved_name = str(getattr(iface, "name", "")).strip() or str(interface_name).strip()
-            logging.info("[CAPTURE] Resolved interface '%s' -> '%s'", interface_name, resolved_name)
+        iface_name = str(getattr(iface, "name", "")).strip()
+
+        if iface_name and iface_name.lower() == lookup:
+            logging.info(
+                "[CAPTURE] Resolved interface '%s' -> '%s'",
+                interface_name,
+                iface_name,
+            )
+            return iface_name
+
+    # 2. Permitir coincidencia exacta con el identificador NPF.
+    for iface in conf.ifaces.values():
+        network_name = str(getattr(iface, "network_name", "")).strip()
+
+        if network_name and network_name.lower() == lookup:
+            resolved_name = (
+                str(getattr(iface, "name", "")).strip()
+                or str(interface_name).strip()
+            )
+            logging.info(
+                "[CAPTURE] Resolved interface '%s' -> '%s'",
+                interface_name,
+                resolved_name,
+            )
             return resolved_name
 
-    logging.info("[CAPTURE] Using interface without remap: %s", interface_name)
+    # 3. Si no existe una coincidencia exacta, conservar el identificador recibido.
+    logging.info(
+        "[CAPTURE] Using interface without remap: %s",
+        interface_name,
+    )
     return str(interface_name).strip()
+     # Hasta aquí ********
 
 
 def _describe_tcp(packet):

@@ -19,10 +19,10 @@ class RouterConfigView(ttk.Frame):
         card = ttk.Frame(self, style="Card.TFrame", padding=24)
         card.pack(fill="both", expand=True)
 
-        ttk.Label(card, text="Router Configuration", style="SectionTitle.TLabel").pack(anchor="w")
+        ttk.Label(card, text="Configuración del router", style="SectionTitle.TLabel").pack(anchor="w")
         ttk.Label(
             card,
-            text=f"Selected interface: {interface_info.name} | {interface_info.ip_address}",
+            text=f"Interfaz seleccionada: {interface_info.name} | {interface_info.ip_address}",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(6, 20))
 
@@ -31,10 +31,10 @@ class RouterConfigView(ttk.Frame):
         form.columnconfigure(1, weight=1)
 
         fields = [
-            ("MikroTik IP", self.host_var, False),
-            ("Username", self.username_var, False),
-            ("Password", self.password_var, True),
-            ("API Port", self.port_var, False),
+            ("IP de MikroTik", self.host_var, False),
+            ("Usuario", self.username_var, False),
+            ("Contraseña", self.password_var, True),
+            ("Puerto API", self.port_var, False),
         ]
 
         for row_index, (label_text, variable, is_password) in enumerate(fields):
@@ -53,10 +53,10 @@ class RouterConfigView(ttk.Frame):
         buttons = ttk.Frame(card, style="Card.TFrame")
         buttons.pack(fill="x", pady=(24, 0))
 
-        self.cancel_button = ttk.Button(buttons, text="Cancel", style="Secondary.TButton", command=self.on_cancel)
+        self.cancel_button = ttk.Button(buttons, text="Cancelar", style="Secondary.TButton", command=self.on_cancel)
         self.cancel_button.pack(side="right")
 
-        self.accept_button = ttk.Button(buttons, text="Accept", style="Primary.TButton", command=self._submit)
+        self.accept_button = ttk.Button(buttons, text="Aceptar", style="Primary.TButton", command=self._submit)
         self.accept_button.pack(side="right", padx=(0, 10))
 
     def _submit(self):

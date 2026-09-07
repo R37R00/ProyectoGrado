@@ -37,10 +37,10 @@ class AppController:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Sistema IDS - Monitor de Trafico")
+        self.root.title("Sistema IDS - Monitor de Tráfico")
         self.root.geometry("1360x820")
         self.root.minsize(1180, 720)
-        self.root.configure(bg="#0f172a")
+        self.root.configure(bg="#ffffff")
 
         self.ui_queue = queue.Queue()
         self.packet_pipeline_queue = queue.Queue(maxsize=2000)
@@ -93,32 +93,39 @@ class AppController:
         style = ttk.Style(self.root)
         style.theme_use("clam")
 
-        style.configure("App.TFrame", background="#0f172a")
-        style.configure("Card.TFrame", background="#111827", relief="flat")
-        style.configure("Panel.TFrame", background="#0b1220", relief="flat")
-        style.configure("SectionTitle.TLabel", background="#111827", foreground="#f8fafc", font=("Segoe UI", 18, "bold"))
-        style.configure("Muted.TLabel", background="#111827", foreground="#94a3b8", font=("Segoe UI", 10))
-        style.configure("Body.TLabel", background="#111827", foreground="#e2e8f0", font=("Segoe UI", 11))
-        style.configure("StatusValue.TLabel", background="#0b1220", foreground="#f8fafc", font=("Segoe UI", 12, "bold"))
+        style.configure("App.TFrame", background="#ffffff")
+        style.configure("Card.TFrame", background="#ffffff", relief="flat")
+        style.configure("Panel.TFrame", background="#f8fafc", relief="flat")
+        style.configure("SectionTitle.TLabel", background="#ffffff", foreground="#0f172a", font=("Segoe UI", 18, "bold"))
+        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b", font=("Segoe UI", 10))
+        style.configure("Body.TLabel", background="#f8fafc", foreground="#1e293b", font=("Segoe UI", 11))
+        style.configure("StatusValue.TLabel", background="#f8fafc", foreground="#0f172a", font=("Segoe UI", 12, "bold"))
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(16, 10), background="#2563eb", foreground="#ffffff")
         style.map(
             "Primary.TButton",
-            background=[("active", "#1d4ed8"), ("disabled", "#334155")],
-            foreground=[("disabled", "#cbd5e1")],
+            background=[("active", "#1d4ed8"), ("disabled", "#cbd5e1")],
+            foreground=[("disabled", "#64748b")],
         )
-        style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(14, 10), background="#1f2937", foreground="#e5e7eb")
+        style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(14, 10), background="#e2e8f0", foreground="#0f172a")
         style.map(
             "Secondary.TButton",
-            background=[("active", "#374151"), ("disabled", "#1f2937")],
-            foreground=[("disabled", "#6b7280")],
+            background=[("active", "#cbd5e1"), ("disabled", "#f1f5f9")],
+            foreground=[("disabled", "#94a3b8")],
         )
-        style.configure("Card.TLabelframe", background="#111827", foreground="#f8fafc", borderwidth=1)
-        style.configure("Card.TLabelframe.Label", background="#111827", foreground="#f8fafc", font=("Segoe UI", 10, "bold"))
-        style.configure("TEntry", fieldbackground="#0b1220", foreground="#f8fafc", insertcolor="#f8fafc", borderwidth=1)
-        style.configure("Treeview", background="#0b1220", fieldbackground="#0b1220", foreground="#e2e8f0", rowheight=28, borderwidth=0)
+        style.configure("Card.TLabelframe", background="#ffffff", foreground="#0f172a", borderwidth=1)
+        style.configure("Card.TLabelframe.Label", background="#ffffff", foreground="#0f172a", font=("Segoe UI", 10, "bold"))
+        style.configure("TEntry", fieldbackground="#ffffff", foreground="#0f172a", insertcolor="#0f172a", borderwidth=1)
+        style.configure("TNotebook", background="#ffffff", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#f1f5f9", foreground="#334155", padding=(14, 8))
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#ffffff"), ("active", "#e2e8f0")],
+            foreground=[("selected", "#0f172a"), ("active", "#0f172a")],
+        )
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground="#0f172a", rowheight=28, borderwidth=0)
         style.map("Treeview", background=[("selected", "#1d4ed8")], foreground=[("selected", "#ffffff")])
-        style.configure("Treeview.Heading", background="#1f2937", foreground="#f8fafc", font=("Segoe UI", 10, "bold"), relief="flat")
-        style.map("Treeview.Heading", background=[("active", "#334155")])
+        style.configure("Treeview.Heading", background="#e2e8f0", foreground="#0f172a", font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#cbd5e1")])
 
     def _set_view(self, widget):
         if self.current_view is not None:
@@ -181,23 +188,23 @@ class AppController:
         port_text = (values.get("port") or "").strip()
 
         if not host_value:
-            raise ValueError("MikroTik IP is required.")
+            raise ValueError("La IP de MikroTik es obligatoria.")
         try:
             ipaddress.IPv4Address(host_value)
         except ValueError as error:
-            raise ValueError("MikroTik IP must be a valid IPv4 address.") from error
+            raise ValueError("La IP de MikroTik debe ser una dirección IPv4 válida.") from error
 
         if not username:
-            raise ValueError("Username is required.")
+            raise ValueError("El usuario es obligatorio.")
 
         if not port_text:
-            raise ValueError("API Port is required.")
+            raise ValueError("El puerto API es obligatorio.")
         if not port_text.isdigit():
-            raise ValueError("API Port must contain only numbers.")
+            raise ValueError("El puerto API debe contener sólo números.")
 
         port_value = int(port_text)
         if port_value < 1 or port_value > 65535:
-            raise ValueError("API Port must be between 1 and 65535.")
+            raise ValueError("El puerto API debe estar entre 1 y 65535.")
 
         return MikroTikConfig(
             host=host_value,
@@ -210,7 +217,7 @@ class AppController:
         if self.startup_in_progress:
             return
         if not self.selected_interface:
-            messagebox.showerror("Interface", "Select a network interface before continuing.")
+            messagebox.showerror("Interfaz", "Selecciona una interfaz de red antes de continuar.")
             self.show_interface_selection()
             return
 
@@ -226,7 +233,7 @@ class AppController:
         self._reset_runtime_services()
 
         logging.info("[UI] Starting MikroTik connection thread")
-        self.router_view.set_busy(True, "Connecting to MikroTik...", keep_cancel_enabled=True)
+        self.router_view.set_busy(True, "Conectando con MikroTik...", keep_cancel_enabled=True)
         self._cancel_connection_timeout()
         self.connection_timeout_job = self.root.after(
             self.CONNECTION_TIMEOUT_MS,
@@ -266,7 +273,7 @@ class AppController:
                 )
                 return
 
-            raise RuntimeError("Could not connect to the MikroTik router. Check IP, credentials, and API port.")
+            raise RuntimeError("No se pudo conectar con el router MikroTik. Revisa la IP, las credenciales y el puerto API.")
         except Exception as error:
             self._cleanup_services(mikrotik_manager=mikrotik_manager)
             self.root.after(0, lambda: self.on_connection_failed(startup_token, str(error)))
@@ -280,9 +287,9 @@ class AppController:
         self.startup_token += 1
         self.connection_timeout_job = None
         if self.router_view is not None:
-            self.router_view.set_busy(False, "Connection timed out.", keep_cancel_enabled=True)
-            self.router_view.set_message("The MikroTik connection did not respond in time.", is_error=True)
-        messagebox.showerror("Connection timeout", "The MikroTik connection did not respond in time.")
+            self.router_view.set_busy(False, "Tiempo de conexión agotado.", keep_cancel_enabled=True)
+            self.router_view.set_message("La conexión con MikroTik no respondió a tiempo.", is_error=True)
+        messagebox.showerror("Tiempo de conexión agotado", "La conexión con MikroTik no respondió a tiempo.")
         self.show_interface_selection()
 
     def on_connection_success(self, startup_token, interface_info, config, mikrotik_manager):
@@ -295,20 +302,20 @@ class AppController:
         logging.info("[UI] Switching to capture screen")
 
         if self.router_view is not None:
-            self.router_view.set_busy(False, "Connected successfully. Preparing capture...", keep_cancel_enabled=False)
+            self.router_view.set_busy(False, "Conexión exitosa. Preparando captura...", keep_cancel_enabled=False)
 
         self._show_packet_view(
             {
                 "interface": interface_info,
                 "config": config,
-                "interface_ip": interface_info.ip_address or "N/A",
-                "interface_network": "Initializing...",
+                "interface_ip": interface_info.ip_address or "N/D",
+                "interface_network": "Inicializando...",
             }
         )
-        self.packet_view.set_mikrotik_status("Connected successfully", connected=True)
-        self.packet_view.set_capture_status("Initializing...")
-        self.packet_view.append_log("[UI] MikroTik connection successful", level="info")
-        self.packet_view.append_log("[UI] Switching to capture screen", level="info")
+        self.packet_view.set_mikrotik_status("Conexión exitosa", connected=True)
+        self.packet_view.set_capture_status("Inicializando...")
+        self.packet_view.append_log("[UI] Conexión con MikroTik exitosa", level="info")
+        self.packet_view.append_log("[UI] Cambiando a la pantalla de captura", level="info")
         self.start_packet_capture(startup_token, interface_info, config, mikrotik_manager)
 
     def on_connection_failed(self, startup_token, error_message):
@@ -321,7 +328,7 @@ class AppController:
         if self.router_view is not None:
             self.router_view.set_busy(False, "", keep_cancel_enabled=True)
             self.router_view.set_message(error_message, is_error=True)
-        messagebox.showerror("Connection error", error_message)
+        messagebox.showerror("Error de conexión", error_message)
         self.show_interface_selection()
 
     def _initialize_capture_worker(self, startup_token, interface_info, config, mikrotik_manager):
@@ -353,7 +360,7 @@ class AppController:
                 self.mikrotik_manager = mikrotik_manager
 
             if not capture_service.start(interface_info.identifier):
-                raise RuntimeError("The packet capture could not be started on the selected interface.")
+                raise RuntimeError("No se pudo iniciar la captura de paquetes en la interfaz seleccionada.")
 
             self.root.after(
                 0,
@@ -362,8 +369,8 @@ class AppController:
                     {
                         "interface": interface_info,
                         "config": config,
-                        "interface_ip": interface_ip or "N/A",
-                        "interface_network": str(interface_network) if interface_network else "N/A",
+                        "interface_ip": interface_ip or "N/D",
+                        "interface_network": str(interface_network) if interface_network else "N/D",
                     },
                 ),
             )
@@ -372,7 +379,7 @@ class AppController:
             self.root.after(
                 0,
                 lambda: self._append_runtime_log(
-                    f"[IDS] Baseline ready on {interface_info.identifier}",
+                    f"[IDS] Línea base lista en {interface_info.identifier}",
                     level="info",
                 ),
             )
@@ -384,9 +391,9 @@ class AppController:
     def start_packet_capture(self, startup_token, interface_info, config, mikrotik_manager):
         logging.info("[CAPTURE] Scheduling packet capture startup for interface: %s", interface_info.identifier)
         if self.packet_view is not None:
-            self.packet_view.set_capture_status("Starting sniff...")
+            self.packet_view.set_capture_status("Iniciando captura...")
             self.packet_view.append_log(
-                f"[CAPTURE] Starting sniff on interface: {interface_info.identifier}",
+                f"[CAPTURA] Iniciando captura en la interfaz: {interface_info.identifier}",
                 level="info",
             )
 
@@ -404,12 +411,12 @@ class AppController:
         self.startup_in_progress = False
         self.packet_view.set_interface(startup_data["interface"].name, startup_data["interface_ip"])
         self.packet_view.set_mikrotik_status(
-            f"Connected to {startup_data['config'].host}:{startup_data['config'].port}",
+            f"Conectado a {startup_data['config'].host}:{startup_data['config'].port}",
             connected=True,
         )
-        self.packet_view.set_capture_status("Running")
+        self.packet_view.set_capture_status("En ejecución")
         self.packet_view.append_log(
-            f"Capture started on {startup_data['interface'].name} ({startup_data['interface'].identifier}) | Network {startup_data['interface_network']}",
+            f"Captura iniciada en {startup_data['interface'].name} ({startup_data['interface'].identifier}) | Red {startup_data['interface_network']}",
             level="info",
         )
 
@@ -509,11 +516,11 @@ class AppController:
         if mikrotik_manager is None:
             return False
         if not mikrotik_manager.is_connected() and not mikrotik_manager.connect():
-            self.ui_queue.put({"type": "status", "data": {"text": "Disconnected", "connected": False}})
+            self.ui_queue.put({"type": "status", "data": {"text": "Desconectado", "connected": False}})
             self._set_host_status(ip_address, "suspicious", attack_type=attack_type, clear_block=True)
-            self._append_runtime_log(f"Failed to block {ip_address} ({attack_type}).", level="error")
+            self._append_runtime_log(f"No se pudo bloquear {ip_address} ({self._translate_attack_type_for_ui(attack_type)}).", level="error")
             return False
-        self.ui_queue.put({"type": "status", "data": {"text": "Connected", "connected": True}})
+        self.ui_queue.put({"type": "status", "data": {"text": "Conectado", "connected": True}})
         attack_context = detection_service.get_attack_context(ip_address, mac_address) if detection_service is not None else None
         victim_ip = attack_context.get("victim_ip") if attack_context else None
         victim_mac = attack_context.get("victim_mac") if attack_context else None
@@ -544,7 +551,7 @@ class AppController:
                 victim_mac=victim_mac,
             )
             self._append_runtime_log(
-                f"Blocked attacker={ip_address} victim={victim_ip or 'unknown'} victim_mac={victim_mac or 'unknown'} attack={attack_type}.",
+                f"Bloqueado atacante={ip_address} víctima={victim_ip or 'desconocida'} mac_víctima={victim_mac or 'desconocida'} ataque={self._translate_attack_type_for_ui(attack_type)}.",
                 level="alert",
             )
             if detection_service is not None and attack_context:
@@ -564,7 +571,7 @@ class AppController:
                 victim_mac=victim_mac,
             )
             self._append_runtime_log(
-                f"Failed to block attacker={ip_address} victim={victim_ip or 'unknown'} attack={attack_type}; router rules were not found.",
+                f"No se pudo bloquear atacante={ip_address} víctima={victim_ip or 'desconocida'} ataque={self._translate_attack_type_for_ui(attack_type)}; no se encontraron reglas en el router.",
                 level="error",
             )
         return blocked
@@ -584,7 +591,7 @@ class AppController:
                 {
                     "type": "log",
                     "data": {
-                        "message": f"Mitigation applied attacker={attacker_ip} victim={victim_ip or 'unknown'} attack={attack_type}.",
+                        "message": f"Mitigación aplicada atacante={attacker_ip} víctima={victim_ip or 'desconocida'} ataque={self._translate_attack_type_for_ui(attack_type)}.",
                         "level": "alert",
                     },
                 }
@@ -596,9 +603,9 @@ class AppController:
         if mikrotik_manager is None:
             return False
         if not mikrotik_manager.is_connected() and not mikrotik_manager.connect():
-            self.ui_queue.put({"type": "status", "data": {"text": "Disconnected", "connected": False}})
+            self.ui_queue.put({"type": "status", "data": {"text": "Desconectado", "connected": False}})
             return False
-        self.ui_queue.put({"type": "status", "data": {"text": "Connected", "connected": True}})
+        self.ui_queue.put({"type": "status", "data": {"text": "Conectado", "connected": True}})
         return bool(mikrotik_manager.unblock_attacker(ip_address, mac_address))
 
     def _format_last_seen(self, timestamp_value):
@@ -656,6 +663,25 @@ class AppController:
         if value.lower() == "manual":
             return "Manual"
         return value or "Unknown"
+
+    def _translate_attack_type_for_ui(self, attack_type):
+        value = str(attack_type or "").strip()
+        normalized = value.upper().replace("_", " ")
+        if not value or normalized == "UNKNOWN":
+            return "desconocido"
+        if "ARP" in normalized:
+            return "suplantación ARP"
+        if "PORT" in normalized or "SCAN" in normalized:
+            return "escaneo de puertos"
+        if "DOS" in normalized:
+            return "denegación de servicio"
+        if "ICMP" in normalized and "FLOOD" in normalized:
+            return "inundación ICMP"
+        if "SYN" in normalized and "FLOOD" in normalized:
+            return "inundación SYN"
+        if normalized == "MANUAL":
+            return "manual"
+        return value
 
     def _severity_for_attack(self, attack_type):
         normalized = self._normalize_attack_type(attack_type).lower()
@@ -850,13 +876,13 @@ class AppController:
             block_type = str(host.get("block_type") or "").strip().lower()
             attack_type = str(host.get("attack_type") or "").strip()
             if block_type == "manual":
-                return "Blocked (Manual)"
+                return "Bloqueado (Manual)"
             if attack_type:
-                return f"Blocked ({attack_type})"
-            return "Blocked"
+                return f"Bloqueado ({self._translate_attack_type_for_ui(attack_type)})"
+            return "Bloqueado"
         if status == "suspicious":
-            return "Suspicious"
-        return "Active"
+            return "Sospechoso"
+        return "Activo"
 
     def _resolve_host_state(self, existing=None, status=None, attack_type=None, clear_block=False):
         existing = existing or {}
@@ -1057,7 +1083,7 @@ class AppController:
 
         self.startup_in_progress = False
         logging.error("[UI] Capture startup failed: %s", error_message)
-        messagebox.showerror("Capture startup error", error_message)
+        messagebox.showerror("Error al iniciar la captura", error_message)
         self.show_interface_selection()
 
     def _cancel_startup(self):
@@ -1088,10 +1114,10 @@ class AppController:
             on_block_host=self.block_host,
         )
         self.packet_view.set_interface(interface_info.name, startup_data["interface_ip"])
-        self.packet_view.set_mikrotik_status("Connecting...", connected=False)
-        self.packet_view.set_capture_status("Initializing...")
+        self.packet_view.set_mikrotik_status("Conectando...", connected=False)
+        self.packet_view.set_capture_status("Inicializando...")
         self.packet_view.append_log(
-            f"Preparing capture on {interface_info.name} ({interface_info.identifier})...",
+            f"Preparando captura en {interface_info.name} ({interface_info.identifier})...",
             level="info",
         )
         self.packet_view.update_hosts(self._serialize_hosts())
@@ -1103,7 +1129,7 @@ class AppController:
         try:
             self.packet_pipeline_queue.put_nowait(packet)
         except queue.Full:
-            self._rate_limited_warning("packet_queue_full", "[PIPELINE] Packet queue full; dropping packets to preserve real-time responsiveness")
+            self._rate_limited_warning("packet_queue_full", "[PIPELINE] Cola de paquetes llena; se descartan paquetes para conservar la respuesta en tiempo real")
 
     def _track_packet_hosts(self, packet):
         if packet.haslayer(ARP):
@@ -1147,9 +1173,10 @@ class AppController:
             self._set_host_status(victim_ip, "active", attack_type=None)
         if attacker_ip or victim_ip:
             log_message = (
-                f"{message}\n"
-                f"Correlation: attacker={attacker_ip or 'unknown'} victim={victim_ip or 'unknown'} "
-                f"victim_mac={victim_mac or self._get_host_mac(victim_ip) or 'unknown'}"
+                f"Alerta detectada: {self._translate_attack_type_for_ui(attack_type)}\n"
+                f"Atacante: {attacker_ip or 'desconocido'}\n"
+                f"Víctima: {victim_ip or 'desconocida'}\n"
+                f"MAC víctima: {victim_mac or self._get_host_mac(victim_ip) or 'desconocida'}"
             )
         else:
             log_message = message
@@ -1183,7 +1210,7 @@ class AppController:
                 {
                     "type": "log",
                     "data": {
-                        "message": f"Router connection is not available. Could not block {normalized_ip}.",
+                        "message": f"La conexión con el router no está disponible. No se pudo bloquear {normalized_ip}.",
                         "level": "error",
                     },
                 }
@@ -1216,7 +1243,7 @@ class AppController:
             mikrotik_manager = self.mikrotik_manager
 
         if mikrotik_manager is None:
-            self._append_runtime_log(f"Could not block {normalized_ip}: router is not connected.", level="error")
+            self._append_runtime_log(f"No se pudo bloquear {normalized_ip}: el router no está conectado.", level="error")
             return False
 
         with self.host_lock:
@@ -1239,7 +1266,7 @@ class AppController:
             mac_address=host_mac,
             attack_type="manual",
         )
-        self._append_runtime_log(f"Manual block queued for {normalized_ip}.", level="warning")
+        self._append_runtime_log(f"Bloqueo manual en cola para {normalized_ip}.", level="warning")
         return True
 
     def pause_capture(self):
@@ -1249,7 +1276,7 @@ class AppController:
             capture_service.pause()
             if self.packet_view is not None:
                 self.packet_view.set_capture_state(paused=True, stopped=False)
-                self.packet_view.append_log("Capture paused.", level="warning")
+                self.packet_view.append_log("Captura pausada.", level="warning")
 
     def resume_capture(self):
         with self.services_lock:
@@ -1258,7 +1285,7 @@ class AppController:
             capture_service.resume()
             if self.packet_view is not None:
                 self.packet_view.set_capture_state(paused=False, stopped=False)
-                self.packet_view.append_log("Capture resumed.", level="info")
+                self.packet_view.append_log("Captura reanudada.", level="info")
 
     def stop_capture(self):
         with self.services_lock:
@@ -1267,7 +1294,7 @@ class AppController:
             capture_service.stop()
         if self.packet_view is not None:
             self.packet_view.set_capture_state(paused=False, stopped=True)
-            self.packet_view.append_log("Capture stopped safely.", level="warning")
+            self.packet_view.append_log("Captura detenida de forma segura.", level="warning")
 
     def unblock_host(self, ip_address):
         normalized_ip = str(ip_address).strip() if ip_address else None
@@ -1279,7 +1306,7 @@ class AppController:
             detection_service = self.detection_service
 
         if mikrotik_manager is None or not mikrotik_manager.is_connected():
-            self._append_runtime_log(f"Could not unblock {normalized_ip}: router is not connected.", level="error")
+            self._append_runtime_log(f"No se pudo desbloquear {normalized_ip}: el router no está conectado.", level="error")
             return False
 
         with self.host_lock:
@@ -1294,7 +1321,7 @@ class AppController:
             mac_address=host_mac,
         )
         if not unblocked:
-            self._append_runtime_log(f"Failed to unblock {normalized_ip}.", level="error")
+            self._append_runtime_log(f"No se pudo desbloquear {normalized_ip}.", level="error")
             return False
 
         if detection_service is not None:
@@ -1305,7 +1332,7 @@ class AppController:
         self._mark_attack_resolved(normalized_ip, status="Unblocked")
         self._record_event_history("Manual", normalized_ip, None, "Unblocked")
         self._schedule_security_refresh()
-        self._append_runtime_log(f"Host {normalized_ip} was manually unblocked.", level="info")
+        self._append_runtime_log(f"El equipo {normalized_ip} fue desbloqueado manualmente.", level="info")
         return True
 
     def process_ui_queue(self):
@@ -1331,7 +1358,7 @@ class AppController:
                 elif task_type == "log":
                     self.deferred_events.append(task)
                 elif task_type == "status" and self.packet_view is not None:
-                    text = task_data.get("text", "Disconnected")
+                    text = task_data.get("text", "Desconectado")
                     self.packet_view.set_mikrotik_status(text, connected=bool(task_data.get("connected")))
                 elif task_type == "status":
                     self.deferred_events.append(task)

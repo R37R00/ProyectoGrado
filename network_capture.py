@@ -11,7 +11,6 @@ from event_logger import log_debug
 
 DEBUG = False
 
-
 class NetworkCaptureScanner:
     def __init__(self, packet_callback, hosts_callback, interface=None):
         self.packet_callback = packet_callback
@@ -51,7 +50,6 @@ class NetworkCaptureScanner:
         self.capture_paused = False
         self.stop_event.clear()
         self.capture_threads = []
-
         for iface in self.interfaces:
             logging.info("[CAPTURE] Starting sniff on interface: %s", iface)
             thread = threading.Thread(
@@ -61,6 +59,7 @@ class NetworkCaptureScanner:
             )
             thread.start()
             self.capture_threads.append(thread)
+
 
         return True
 

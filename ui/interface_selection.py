@@ -15,10 +15,10 @@ class InterfaceSelectionView(ttk.Frame):
         hero = ttk.Frame(self, style="Card.TFrame", padding=22)
         hero.pack(fill="both", expand=True)
 
-        ttk.Label(hero, text="Select Capture Interface", style="SectionTitle.TLabel").pack(anchor="w")
+        ttk.Label(hero, text="Seleccionar interfaz de captura", style="SectionTitle.TLabel").pack(anchor="w")
         ttk.Label(
             hero,
-            text="Choose the network adapter to monitor. The layout is optimized for one-click review and double-click selection, similar to Wireshark.",
+            text="Elige el adaptador de red que deseas monitorear. La vista está optimizada para revisión rápida y selección con doble clic, similar a Wireshark.",
             style="Muted.TLabel",
             wraplength=1020,
             justify="left",
@@ -29,9 +29,9 @@ class InterfaceSelectionView(ttk.Frame):
 
         columns = ("name", "description", "ip")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
-        self.tree.heading("name", text="Interface")
-        self.tree.heading("description", text="Description")
-        self.tree.heading("ip", text="IP Address")
+        self.tree.heading("name", text="Interfaz")
+        self.tree.heading("description", text="Descripción")
+        self.tree.heading("ip", text="Dirección IP")
         self.tree.column("name", width=300, anchor="w")
         self.tree.column("description", width=560, anchor="w")
         self.tree.column("ip", width=180, anchor="center")
@@ -47,13 +47,13 @@ class InterfaceSelectionView(ttk.Frame):
         footer = ttk.Frame(hero, style="Card.TFrame")
         footer.pack(fill="x", pady=(16, 0))
 
-        self.selection_label = ttk.Label(footer, text="No interface selected.", style="Muted.TLabel")
+        self.selection_label = ttk.Label(footer, text="No hay ninguna interfaz seleccionada.", style="Muted.TLabel")
         self.selection_label.pack(side="left")
 
-        ttk.Button(footer, text="Refresh", style="Secondary.TButton", command=self.on_refresh).pack(side="right")
+        ttk.Button(footer, text="Actualizar", style="Secondary.TButton", command=self.on_refresh).pack(side="right")
         self.continue_button = ttk.Button(
             footer,
-            text="Continue",
+            text="Continuar",
             style="Primary.TButton",
             command=self._submit_selection,
             state="disabled",
@@ -82,7 +82,7 @@ class InterfaceSelectionView(ttk.Frame):
             self.tree.see(first_id)
             self._update_selection_state()
         else:
-            self.selection_label.configure(text="No interfaces were detected on this system.")
+            self.selection_label.configure(text="No se detectaron interfaces en este sistema.")
             self.continue_button.configure(state="disabled")
 
     def _selected_interface(self):
@@ -94,12 +94,12 @@ class InterfaceSelectionView(ttk.Frame):
     def _update_selection_state(self, _event=None):
         interface = self._selected_interface()
         if interface is None:
-            self.selection_label.configure(text="No interface selected.")
+            self.selection_label.configure(text="No hay ninguna interfaz seleccionada.")
             self.continue_button.configure(state="disabled")
             return
 
         self.selection_label.configure(
-            text=f"Selected: {interface.name} | IP {interface.ip_address}"
+            text=f"Seleccionada: {interface.name} | IP {interface.ip_address}"
         )
         self.continue_button.configure(state="normal")
 

@@ -21,6 +21,66 @@ class PacketView(ttk.Frame):
 
         self._build_layout()
 
+    def _translate_attack_type(self, value):
+        text = str(value or "").strip()
+        normalized = text.upper().replace("_", " ")
+        if not text or normalized == "UNKNOWN":
+            return "Desconocido"
+        if "ARP" in normalized:
+            return "Suplantación ARP"
+        if "PORT" in normalized or "SCAN" in normalized:
+            return "Escaneo de puertos"
+        if "DOS" in normalized:
+            return "Denegación de servicio"
+        if "ICMP" in normalized and "FLOOD" in normalized:
+            return "Inundación ICMP"
+        if "SYN" in normalized and "FLOOD" in normalized:
+            return "Inundación SYN"
+        if normalized == "MANUAL":
+            return "Manual"
+        return text
+
+    def _translate_status(self, value):
+        text = str(value or "").strip()
+        normalized = text.lower()
+        translations = {
+            "active": "Activo",
+            "detected": "Detectado",
+            "blocked": "Bloqueado",
+            "blocked (manual)": "Bloqueado (Manual)",
+            "suspicious": "Sospechoso",
+            "queued": "En cola",
+            "resolved": "Resuelto",
+            "unblocked": "Desbloqueado",
+            "mitigated": "Mitigado",
+            "block failed": "Bloqueo fallido",
+            "running": "En ejecución",
+            "paused": "Pausado",
+            "stopped": "Detenido",
+            "unknown": "Desconocido",
+        }
+        if normalized.startswith("blocked (") and normalized.endswith(")"):
+            attack_name = text[text.find("(") + 1 : -1]
+            return f"Bloqueado ({self._translate_attack_type(attack_name)})"
+        return translations.get(normalized, text or "Desconocido")
+
+    def _translate_severity(self, value):
+        text = str(value or "").strip()
+        translations = {
+            "critical": "Crítica",
+            "warning": "Advertencia",
+            "suspicious": "Sospechosa",
+            "resolved": "Resuelta",
+            "failed": "Fallida",
+        }
+        return translations.get(text.lower(), text or "Desconocida")
+
+    def _translate_placeholder(self, value):
+        text = str(value or "").strip()
+        if not text or text.lower() in {"unknown", "n/a"}:
+            return "Desconocido"
+        return text
+
     def _build_layout(self):
         outer = ttk.Frame(self, style="Card.TFrame", padding=18)
         outer.pack(fill="both", expand=True)
@@ -28,23 +88,23 @@ class PacketView(ttk.Frame):
         header = ttk.Frame(outer, style="Card.TFrame")
         header.pack(fill="x")
 
-        ttk.Label(header, text="Packet Capture", style="SectionTitle.TLabel").pack(side="left")
+        ttk.Label(header, text="Captura de paquetes", style="SectionTitle.TLabel").pack(side="left")
 
         controls = ttk.Frame(header, style="Card.TFrame")
         controls.pack(side="right")
-        self.pause_button = ttk.Button(controls, text="Pause", style="Secondary.TButton", command=self.on_pause)
+        self.pause_button = ttk.Button(controls, text="Pausar", style="Secondary.TButton", command=self.on_pause)
         self.pause_button.pack(side="left")
-        self.resume_button = ttk.Button(controls, text="Resume", style="Secondary.TButton", command=self.on_resume)
+        self.resume_button = ttk.Button(controls, text="Reanudar", style="Secondary.TButton", command=self.on_resume)
         self.resume_button.pack(side="left", padx=8)
-        self.stop_button = ttk.Button(controls, text="Stop", style="Primary.TButton", command=self.on_stop)
+        self.stop_button = ttk.Button(controls, text="Detener", style="Primary.TButton", command=self.on_stop)
         self.stop_button.pack(side="left")
 
         status_bar = ttk.Frame(outer, style="Card.TFrame")
         status_bar.pack(fill="x", pady=(14, 16))
 
-        self.interface_value = self._build_status_card(status_bar, "Selected Interface", "N/A")
-        self.mikrotik_value = self._build_status_card(status_bar, "MikroTik Status", "Disconnected")
-        self.capture_value = self._build_status_card(status_bar, "Capture State", "Running")
+        self.interface_value = self._build_status_card(status_bar, "Interfaz seleccionada", "N/D")
+        self.mikrotik_value = self._build_status_card(status_bar, "Estado de MikroTik", "Desconectado")
+        self.capture_value = self._build_status_card(status_bar, "Estado de captura", "En ejecución")
 
         split = ttk.Panedwindow(outer, orient="vertical")
         split.pack(fill="both", expand=True)
@@ -61,12 +121,12 @@ class PacketView(ttk.Frame):
         alerts_panel = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
         events_panel = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
         hosts_panel = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
-        notebook.add(packets_panel, text="Traffic")
-        notebook.add(alerts_panel, text="Active Alerts")
-        notebook.add(events_panel, text="Event History")
-        notebook.add(hosts_panel, text="Hosts")
+        notebook.add(packets_panel, text="Tráfico")
+        notebook.add(alerts_panel, text="Alertas activas")
+        notebook.add(events_panel, text="Historial de eventos")
+        notebook.add(hosts_panel, text="Equipos")
 
-        ttk.Label(packets_panel, text="Live Traffic", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(packets_panel, text="Tráfico en vivo", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
 
         table_wrap = ttk.Frame(packets_panel, style="Panel.TFrame")
         table_wrap.pack(fill="both", expand=True)
@@ -75,12 +135,12 @@ class PacketView(ttk.Frame):
         self.tree = ttk.Treeview(table_wrap, columns=columns, show="headings")
         headings = {
             "number": "No.",
-            "time": "Time",
-            "source": "Source",
-            "destination": "Destination",
-            "protocol": "Protocol",
-            "length": "Length",
-            "info": "Info",
+            "time": "Hora",
+            "source": "Origen",
+            "destination": "Destino",
+            "protocol": "Protocolo",
+            "length": "Longitud",
+            "info": "Información",
         }
         widths = {
             "number": 70,
@@ -109,27 +169,27 @@ class PacketView(ttk.Frame):
         yscroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=yscroll.set)
 
-        self.tree.tag_configure("TCP", background="#0f172a")
-        self.tree.tag_configure("UDP", background="#10213f")
-        self.tree.tag_configure("ARP", background="#1a2e05")
-        self.tree.tag_configure("ICMP", background="#312e81")
-        self.tree.tag_configure("OTHER", background="#111827")
+        self.tree.tag_configure("TCP", background="#eff6ff", foreground="#172554")
+        self.tree.tag_configure("UDP", background="#eef2ff", foreground="#312e81")
+        self.tree.tag_configure("ARP", background="#f0fdf4", foreground="#14532d")
+        self.tree.tag_configure("ICMP", background="#fefce8", foreground="#713f12")
+        self.tree.tag_configure("OTHER", background="#ffffff", foreground="#0f172a")
 
-        ttk.Label(alerts_panel, text="Active Security Alerts", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(alerts_panel, text="Alertas de seguridad activas", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
         alerts_wrap = ttk.Frame(alerts_panel, style="Panel.TFrame")
         alerts_wrap.pack(fill="both", expand=True)
 
         alert_columns = ("time", "severity", "type", "attacker", "victim", "victim_mac", "status", "count")
         self.alerts_tree = ttk.Treeview(alerts_wrap, columns=alert_columns, show="headings")
         alert_headings = {
-            "time": "Last Seen",
-            "severity": "Severity",
-            "type": "Attack Type",
-            "attacker": "Attacker",
-            "victim": "Victim",
-            "victim_mac": "Victim MAC",
-            "status": "Status",
-            "count": "Events",
+            "time": "Última actividad",
+            "severity": "Severidad",
+            "type": "Tipo de ataque",
+            "attacker": "Atacante",
+            "victim": "Víctima",
+            "victim_mac": "MAC víctima",
+            "status": "Estado",
+            "count": "Eventos",
         }
         alert_widths = {
             "time": 100,
@@ -148,24 +208,24 @@ class PacketView(ttk.Frame):
         alerts_scroll = ttk.Scrollbar(alerts_wrap, orient="vertical", command=self.alerts_tree.yview)
         alerts_scroll.pack(side="right", fill="y")
         self.alerts_tree.configure(yscrollcommand=alerts_scroll.set)
-        self.alerts_tree.tag_configure("critical", background="#5f1717", foreground="#fee2e2")
-        self.alerts_tree.tag_configure("warning", background="#5a3510", foreground="#ffedd5")
-        self.alerts_tree.tag_configure("suspicious", background="#4a3a12", foreground="#fef3c7")
-        self.alerts_tree.tag_configure("resolved", background="#12351e", foreground="#dcfce7")
-        self.alerts_tree.tag_configure("failed", background="#3f1d2b", foreground="#fce7f3")
+        self.alerts_tree.tag_configure("critical", background="#fee2e2", foreground="#7f1d1d")
+        self.alerts_tree.tag_configure("warning", background="#ffedd5", foreground="#7c2d12")
+        self.alerts_tree.tag_configure("suspicious", background="#fef3c7", foreground="#713f12")
+        self.alerts_tree.tag_configure("resolved", background="#dcfce7", foreground="#14532d")
+        self.alerts_tree.tag_configure("failed", background="#fce7f3", foreground="#831843")
 
-        ttk.Label(events_panel, text="Event History", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(events_panel, text="Historial de eventos", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
         events_wrap = ttk.Frame(events_panel, style="Panel.TFrame")
         events_wrap.pack(fill="both", expand=True)
 
         event_columns = ("timestamp", "type", "attacker", "victim", "status")
         self.events_tree = ttk.Treeview(events_wrap, columns=event_columns, show="headings")
         event_headings = {
-            "timestamp": "Timestamp",
-            "type": "Type",
-            "attacker": "Attacker",
-            "victim": "Victim",
-            "status": "Status",
+            "timestamp": "Fecha y hora",
+            "type": "Tipo",
+            "attacker": "Atacante",
+            "victim": "Víctima",
+            "status": "Estado",
         }
         event_widths = {
             "timestamp": 190,
@@ -181,17 +241,17 @@ class PacketView(ttk.Frame):
         events_scroll = ttk.Scrollbar(events_wrap, orient="vertical", command=self.events_tree.yview)
         events_scroll.pack(side="right", fill="y")
         self.events_tree.configure(yscrollcommand=events_scroll.set)
-        self.events_tree.tag_configure("blocked", background="#4c1d1d")
-        self.events_tree.tag_configure("detected", background="#4a3a12")
-        self.events_tree.tag_configure("resolved", background="#12351e")
-        self.events_tree.tag_configure("failed", background="#3f1d2b")
+        self.events_tree.tag_configure("blocked", background="#fee2e2", foreground="#7f1d1d")
+        self.events_tree.tag_configure("detected", background="#fef3c7", foreground="#713f12")
+        self.events_tree.tag_configure("resolved", background="#dcfce7", foreground="#14532d")
+        self.events_tree.tag_configure("failed", background="#fce7f3", foreground="#831843")
 
         hosts_header = ttk.Frame(hosts_panel, style="Panel.TFrame")
         hosts_header.pack(fill="x", pady=(0, 8))
-        ttk.Label(hosts_header, text="Detected Hosts", style="Body.TLabel").pack(side="left")
+        ttk.Label(hosts_header, text="Equipos detectados", style="Body.TLabel").pack(side="left")
         self.block_button = ttk.Button(
             hosts_header,
-            text="Block Selected",
+            text="Bloquear seleccionado",
             style="Primary.TButton",
             command=self._request_block,
             state="disabled",
@@ -199,7 +259,7 @@ class PacketView(ttk.Frame):
         self.block_button.pack(side="right", padx=(0, 8))
         self.unblock_button = ttk.Button(
             hosts_header,
-            text="Unblock Selected",
+            text="Desbloquear seleccionado",
             style="Secondary.TButton",
             command=self._request_unblock,
             state="disabled",
@@ -214,9 +274,9 @@ class PacketView(ttk.Frame):
         host_headings = {
             "ip": "IP",
             "mac": "MAC",
-            "status": "Status",
-            "attack_type": "Attack Type",
-            "last_seen": "Last Seen",
+            "status": "Estado",
+            "attack_type": "Tipo de ataque",
+            "last_seen": "Última actividad",
         }
         host_widths = {
             "ip": 180,
@@ -233,28 +293,28 @@ class PacketView(ttk.Frame):
         hosts_scroll = ttk.Scrollbar(hosts_wrap, orient="vertical", command=self.hosts_tree.yview)
         hosts_scroll.pack(side="right", fill="y")
         self.hosts_tree.configure(yscrollcommand=hosts_scroll.set)
-        self.hosts_tree.tag_configure("active", background="#12351e")
-        self.hosts_tree.tag_configure("blocked", background="#4c1d1d")
-        self.hosts_tree.tag_configure("suspicious", background="#4a3a12")
+        self.hosts_tree.tag_configure("active", background="#dcfce7", foreground="#14532d")
+        self.hosts_tree.tag_configure("blocked", background="#fee2e2", foreground="#7f1d1d")
+        self.hosts_tree.tag_configure("suspicious", background="#fef3c7", foreground="#713f12")
         self.hosts_tree.bind("<<TreeviewSelect>>", self._on_host_selected)
 
-        ttk.Label(logs_panel, text="System Logs", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(logs_panel, text="Registros del sistema", style="Body.TLabel").pack(anchor="w", pady=(0, 8))
 
         self.log_text = ScrolledText(
             logs_panel,
             height=8,
-            bg="#020617",
-            fg="#e2e8f0",
-            insertbackground="#f8fafc",
+            bg="#ffffff",
+            fg="#0f172a",
+            insertbackground="#0f172a",
             relief="flat",
             font=("Consolas", 10),
         )
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
-        self.log_text.tag_configure("info", foreground="#cbd5e1")
-        self.log_text.tag_configure("warning", foreground="#fbbf24")
-        self.log_text.tag_configure("alert", foreground="#f87171")
-        self.log_text.tag_configure("error", foreground="#fb7185")
+        self.log_text.tag_configure("info", foreground="#334155")
+        self.log_text.tag_configure("warning", foreground="#b45309")
+        self.log_text.tag_configure("alert", foreground="#dc2626")
+        self.log_text.tag_configure("error", foreground="#be123c")
 
     def _build_status_card(self, parent, title, value):
         card = ttk.Frame(parent, style="Panel.TFrame", padding=12)
@@ -269,22 +329,22 @@ class PacketView(ttk.Frame):
 
     def set_mikrotik_status(self, text, connected):
         self.mikrotik_value.configure(text=text)
-        self.mikrotik_value.configure(foreground="#4ade80" if connected else "#f87171")
+        self.mikrotik_value.configure(foreground="#15803d" if connected else "#dc2626")
 
     def set_capture_state(self, paused=False, stopped=False):
         if stopped:
-            self.set_capture_status("Stopped")
+            self.set_capture_status("Detenido")
             self.pause_button.configure(state="disabled")
             self.resume_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
             return
 
         if paused:
-            self.set_capture_status("Paused")
+            self.set_capture_status("Pausado")
             self.pause_button.configure(state="disabled")
             self.resume_button.configure(state="normal")
         else:
-            self.set_capture_status("Running")
+            self.set_capture_status("En ejecución")
             self.pause_button.configure(state="normal")
             self.resume_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -363,19 +423,19 @@ class PacketView(ttk.Frame):
 
         for host in hosts:
             status = str(host.get("status", "active")).strip().lower()
-            ip_address = host.get("ip", "N/A")
+            ip_address = host.get("ip", "N/D")
             self.host_state_by_ip[str(ip_address).strip()] = dict(host)
             is_blocked = bool(host.get("is_blocked", False))
-            display_status = host.get("display_status") or status.title()
+            display_status = self._translate_status(host.get("display_status") or status)
             attack_type = host.get("attack_type")
             if attack_type:
-                attack_type = str(attack_type).replace("_", " ").title()
+                attack_type = self._translate_attack_type(attack_type)
             self.hosts_tree.insert(
                 "",
                 "end",
                 values=(
                     ip_address,
-                    host.get("mac", "unknown"),
+                    self._translate_placeholder(host.get("mac", "unknown")),
                     display_status,
                     attack_type or "-",
                     host.get("last_seen", "-"),
@@ -408,12 +468,12 @@ class PacketView(ttk.Frame):
                 "end",
                 values=(
                     alert.get("timestamp", "-"),
-                    severity.upper(),
-                    alert.get("type", "Unknown"),
-                    alert.get("attacker", "unknown"),
-                    alert.get("victim", "unknown"),
-                    alert.get("victim_mac", "unknown"),
-                    status.upper(),
+                    self._translate_severity(severity).upper(),
+                    self._translate_attack_type(alert.get("type", "Unknown")),
+                    self._translate_placeholder(alert.get("attacker", "unknown")),
+                    self._translate_placeholder(alert.get("victim", "unknown")),
+                    self._translate_placeholder(alert.get("victim_mac", "unknown")),
+                    self._translate_status(status).upper(),
                     alert.get("count", 1),
                 ),
                 tags=(tag,),
@@ -438,10 +498,10 @@ class PacketView(ttk.Frame):
                 "end",
                 values=(
                     event.get("timestamp", "-"),
-                    event.get("type", "Unknown"),
-                    event.get("attacker", "unknown"),
-                    event.get("victim", "unknown"),
-                    event.get("status", "unknown"),
+                    self._translate_attack_type(event.get("type", "Unknown")),
+                    self._translate_placeholder(event.get("attacker", "unknown")),
+                    self._translate_placeholder(event.get("victim", "unknown")),
+                    self._translate_status(event.get("status", "unknown")),
                 ),
                 tags=(tag,),
             )

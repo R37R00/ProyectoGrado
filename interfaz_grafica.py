@@ -42,7 +42,7 @@ class MainWindow(QMainWindow):
         self.active_alerts = {}
         self.total_alerts = 0
 
-        self.setWindowTitle("Sistema de Deteccion de Amenazas en Redes Locales")
+        self.setWindowTitle("Sistema de Detección de Amenazas en Redes Locales")
         self.init_ui()
 
         self.packet_received_signal.connect(self.update_packet_display)
@@ -78,10 +78,10 @@ class MainWindow(QMainWindow):
         status_frame.setFrameShape(QFrame.StyledPanel)
         status_layout = QHBoxLayout(status_frame)
 
-        self.monitoring_status_label = QLabel("MONITORING")
-        self.interface_status_label = QLabel("Interface: N/A")
+        self.monitoring_status_label = QLabel("MONITOREANDO")
+        self.interface_status_label = QLabel("Interfaz: N/D")
         self.host_count_status_label = QLabel("Hosts: 0")
-        self.protection_status_label = QLabel("Protection: ON")
+        self.protection_status_label = QLabel("Protección: ACTIVADA")
 
         status_layout.addWidget(self.monitoring_status_label)
         status_layout.addWidget(self.interface_status_label)
@@ -95,10 +95,10 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.current_status_label = QLabel("Current status: Monitoring")
-        self.last_alert_label = QLabel("Last alert: None")
-        self.total_hosts_label = QLabel("Total hosts detected: 0")
-        self.threat_level_label = QLabel("Threat level: LOW")
+        self.current_status_label = QLabel("Estado actual: Monitoreando")
+        self.last_alert_label = QLabel("Última alerta: Ninguna")
+        self.total_hosts_label = QLabel("Total de hosts detectados: 0")
+        self.threat_level_label = QLabel("Nivel de amenaza: BAJO")
 
         self.packet_text_edit = QTextEdit()
         self.packet_text_edit.setReadOnly(True)
@@ -109,33 +109,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.threat_level_label)
         layout.addWidget(self.packet_text_edit)
 
-        self.tab_widget.addTab(tab, "Dashboard")
+        self.tab_widget.addTab(tab, "Panel")
 
     def _build_alerts_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.anomaly_label = QLabel("Network Anomaly Detected")
+        self.anomaly_label = QLabel("Anomalía de red detectada")
         self.anomaly_text = QTextEdit()
         self.anomaly_text.setReadOnly(True)
         self.anomaly_text.document().setMaximumBlockCount(200)
 
         self.alerts_table = QTableWidget(0, 5)
-        self.alerts_table.setHorizontalHeaderLabels(["Timestamp", "Type", "Attacker", "Victim", "Status"])
+        self.alerts_table.setHorizontalHeaderLabels(["Fecha y hora", "Tipo", "Atacante", "Víctima", "Estado"])
         self.alerts_table.horizontalHeader().setStretchLastSection(True)
 
         layout.addWidget(self.anomaly_label)
         layout.addWidget(self.anomaly_text)
         layout.addWidget(self.alerts_table)
 
-        self.tab_widget.addTab(tab, "Alerts (0)")
+        self.tab_widget.addTab(tab, "Alertas (0)")
 
     def _build_hosts_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
         self.hosts_table = QTableWidget(0, 6)
-        self.hosts_table.setHorizontalHeaderLabels(["IP", "MAC", "Interface", "Status", "Type", "Activity"])
+        self.hosts_table.setHorizontalHeaderLabels(["IP", "MAC", "Interfaz", "Estado", "Tipo", "Actividad"])
         self.hosts_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.hosts_table)
 
@@ -148,15 +148,15 @@ class MainWindow(QMainWindow):
         self.hosts_combo_box = QComboBox()
         layout.addWidget(self.hosts_combo_box)
 
-        self.block_connection_button = QPushButton("Cortar Conexion")
+        self.block_connection_button = QPushButton("Cortar conexión")
         self.block_connection_button.clicked.connect(self.block_selected_connection)
         layout.addWidget(self.block_connection_button)
 
-        self.unblock_connection_button = QPushButton("Permitir conexion")
+        self.unblock_connection_button = QPushButton("Permitir conexión")
         self.unblock_connection_button.clicked.connect(self.unblock_selected_connection)
         layout.addWidget(self.unblock_connection_button)
 
-        self.find_hosts_button = QPushButton("Buscar Hosts")
+        self.find_hosts_button = QPushButton("Buscar hosts")
         self.find_hosts_button.clicked.connect(self.find_hosts)
         layout.addWidget(self.find_hosts_button)
 
@@ -166,11 +166,11 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.mitigation_enabled_checkbox = QCheckBox("Enable automatic mitigation")
+        self.mitigation_enabled_checkbox = QCheckBox("Activar mitigación automática")
         self.mitigation_enabled_checkbox.setChecked(True)
-        self.periodic_restoration_checkbox = QCheckBox("Periodic ARP restoration")
-        self.lock_gateway_checkbox = QCheckBox("Lock gateway ARP entry")
-        self.aggressive_defense_checkbox = QCheckBox("Aggressive defense mode")
+        self.periodic_restoration_checkbox = QCheckBox("Restauración ARP periódica")
+        self.lock_gateway_checkbox = QCheckBox("Fijar entrada ARP del gateway")
+        self.aggressive_defense_checkbox = QCheckBox("Modo de defensa agresivo")
 
         layout.addWidget(self.mitigation_enabled_checkbox)
         layout.addWidget(self.periodic_restoration_checkbox)
@@ -178,7 +178,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.aggressive_defense_checkbox)
         layout.addStretch()
 
-        self.tab_widget.addTab(tab, "Protection")
+        self.tab_widget.addTab(tab, "Protección")
 
     def _build_settings_tab(self):
         tab = QWidget()
@@ -190,7 +190,7 @@ class MainWindow(QMainWindow):
         self.capture_interface_list_widget.itemSelectionChanged.connect(self.on_interface_selected)
         self.active_capture_label = QLabel("Capturando en: Ninguna")
 
-        self.sensitivity_label = QLabel("Detection sensitivity")
+        self.sensitivity_label = QLabel("Sensibilidad de detección")
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         self.sensitivity_slider.setMinimum(1)
         self.sensitivity_slider.setMaximum(10)
@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stop_button)
         layout.addStretch()
 
-        self.tab_widget.addTab(tab, "Settings")
+        self.tab_widget.addTab(tab, "Configuración")
 
     def set_capture_interfaces(self, interfaces):
         self.capture_interface_list_widget.clear()
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
             self.capture_interface_list_widget.item(0).setSelected(True)
 
         selected = self.get_selected_capture_interfaces()
-        interface_text = ", ".join(selected) if selected else "N/A"
+        interface_text = ", ".join(selected) if selected else "N/D"
         self.update_status(interface=interface_text)
 
     def on_interface_selected(self):
@@ -421,6 +421,44 @@ class MainWindow(QMainWindow):
     def update_packet_display(self, packet_summary):
         self.packet_text_edit.append(packet_summary)
 
+    def _display_attack_type(self, alert_type):
+        value = str(alert_type or "").strip()
+        normalized = value.upper().replace("_", " ")
+        if not value or normalized == "UNKNOWN":
+            return "Desconocido"
+        if "ARP" in normalized:
+            return "Suplantación ARP"
+        if "PORT" in normalized or "SCAN" in normalized:
+            return "Escaneo de puertos"
+        if "DOS" in normalized:
+            return "Denegación de servicio"
+        if "BLOCK" in normalized:
+            return "Bloqueado"
+        if "ANOMALY" in normalized:
+            return "Anomalía"
+        return value
+
+    def _display_status(self, status):
+        value = str(status or "").strip()
+        translations = {
+            "detected": "Detectado",
+            "blocked": "Bloqueado",
+            "trusted": "Confiable",
+            "unknown": "Desconocido",
+            "attacker": "Atacante",
+            "suspicious": "Sospechoso",
+        }
+        return translations.get(value.lower(), value or "Desconocido")
+
+    def _display_severity(self, severity):
+        value = str(severity or "").strip()
+        translations = {
+            "high": "ALTO",
+            "low": "BAJO",
+            "medium": "MEDIO",
+        }
+        return translations.get(value.lower(), value or "DESCONOCIDO")
+
     def add_alert(self, alert_type, attacker, victim, status, raw_message, severity="LOW"):
         key = f"{alert_type}|{attacker}|{victim}"
         is_new = key not in self.active_alerts
@@ -435,10 +473,10 @@ class MainWindow(QMainWindow):
 
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.alerts_table.setItem(row, 0, QTableWidgetItem(timestamp))
-        self.alerts_table.setItem(row, 1, QTableWidgetItem(alert_type))
+        self.alerts_table.setItem(row, 1, QTableWidgetItem(self._display_attack_type(alert_type)))
         self.alerts_table.setItem(row, 2, QTableWidgetItem(attacker))
         self.alerts_table.setItem(row, 3, QTableWidgetItem(victim))
-        self.alerts_table.setItem(row, 4, QTableWidgetItem(status))
+        self.alerts_table.setItem(row, 4, QTableWidgetItem(self._display_status(status)))
 
         if severity == "HIGH":
             for col in range(5):
@@ -447,12 +485,12 @@ class MainWindow(QMainWindow):
                     item.setBackground(QColor("#ffcccc"))
             self.tab_widget.setCurrentIndex(1)
 
-        self.tab_widget.setTabText(1, f"Alerts ({self.total_alerts})")
-        self.last_alert_label.setText(f"Last alert: {alert_type} | {attacker} -> {victim}")
+        self.tab_widget.setTabText(1, f"Alertas ({self.total_alerts})")
+        self.last_alert_label.setText(f"Última alerta: {self._display_attack_type(alert_type)} | {attacker} -> {victim}")
         self.current_status_label.setText(
-            "Current status: Attack detected" if severity == "HIGH" else "Current status: Monitoring"
+            "Estado actual: Ataque detectado" if severity == "HIGH" else "Estado actual: Monitoreando"
         )
-        self.threat_level_label.setText(f"Threat level: {severity}")
+        self.threat_level_label.setText(f"Nivel de amenaza: {self._display_severity(severity)}")
         self.anomaly_text.append(raw_message)
 
     def remove_alerts_for_ip(self, ip_address):
@@ -470,14 +508,14 @@ class MainWindow(QMainWindow):
 
         rebuilt_alerts = {}
         for row in range(self.alerts_table.rowCount()):
-            alert_type = self.alerts_table.item(row, 1).text().strip() if self.alerts_table.item(row, 1) else "Anomaly"
-            attacker = self.alerts_table.item(row, 2).text().strip() if self.alerts_table.item(row, 2) else "Unknown"
-            victim = self.alerts_table.item(row, 3).text().strip() if self.alerts_table.item(row, 3) else "Unknown"
+            alert_type = self.alerts_table.item(row, 1).text().strip() if self.alerts_table.item(row, 1) else "Anomalía"
+            attacker = self.alerts_table.item(row, 2).text().strip() if self.alerts_table.item(row, 2) else "Desconocido"
+            victim = self.alerts_table.item(row, 3).text().strip() if self.alerts_table.item(row, 3) else "Desconocido"
             rebuilt_alerts[f"{alert_type}|{attacker}|{victim}"] = row
 
         self.active_alerts = rebuilt_alerts
         self.total_alerts = self.alerts_table.rowCount()
-        self.tab_widget.setTabText(1, f"Alerts ({self.total_alerts})")
+        self.tab_widget.setTabText(1, f"Alertas ({self.total_alerts})")
 
     def _normalize_host_status(self, status):
         return (status or "trusted").strip().lower()
@@ -491,15 +529,15 @@ class MainWindow(QMainWindow):
             data = self.hosts[host_ip]
             interface_text = data.get("interface", "Unknown")
             status_value = self._normalize_host_status(data.get("status"))
-            display_status = status_value.title()
+            display_status = self._display_status(status_value)
 
             self.hosts_table.insertRow(row)
             self.hosts_table.setItem(row, 0, QTableWidgetItem(host_ip))
             self.hosts_table.setItem(row, 1, QTableWidgetItem(data.get("mac", "unknown")))
             self.hosts_table.setItem(row, 2, QTableWidgetItem(interface_text))
             self.hosts_table.setItem(row, 3, QTableWidgetItem(display_status))
-            self.hosts_table.setItem(row, 4, QTableWidgetItem(data.get("type", "Host")))
-            self.hosts_table.setItem(row, 5, QTableWidgetItem(data.get("activity", "Normal")))
+            self.hosts_table.setItem(row, 4, QTableWidgetItem("Host" if data.get("type", "Host") == "Host" else data.get("type", "Host")))
+            self.hosts_table.setItem(row, 5, QTableWidgetItem("Normal" if data.get("activity", "Normal") == "Normal" else data.get("activity", "Normal")))
 
             color = QColor("#ccffcc")
             if status_value == "unknown":
@@ -516,7 +554,7 @@ class MainWindow(QMainWindow):
 
             descriptor = (
                 f"IP: {host_ip}, MAC: {data.get('mac', 'unknown')}, "
-                f"IFACE: {interface_text}, STATUS: {display_status}"
+                f"Interfaz: {interface_text}, Estado: {display_status}"
             )
             self.hosts_text_edit.append(descriptor)
             device_descriptors.append(descriptor)
@@ -524,7 +562,7 @@ class MainWindow(QMainWindow):
         self.update_device_selector(device_descriptors)
 
         self.update_status(host_count=len(self.hosts))
-        self.total_hosts_label.setText(f"Total hosts detected: {len(self.hosts)}")
+        self.total_hosts_label.setText(f"Total de hosts detectados: {len(self.hosts)}")
 
     def update_device_selector(self, devices):
         normalized_devices = list(devices or [])
@@ -575,21 +613,21 @@ class MainWindow(QMainWindow):
 
     def update_status(self, monitoring_on=None, interface=None, host_count=None, protection_on=None):
         if monitoring_on is not None:
-            self.monitoring_status_label.setText("MONITORING" if monitoring_on else "STOPPED")
+            self.monitoring_status_label.setText("MONITOREANDO" if monitoring_on else "DETENIDO")
         if interface is not None:
-            self.interface_status_label.setText(f"Interface: {interface}")
+            self.interface_status_label.setText(f"Interfaz: {interface}")
         if host_count is not None:
             self.host_count_status_label.setText(f"Hosts: {host_count}")
         if protection_on is not None:
-            self.protection_status_label.setText("Protection: ON" if protection_on else "Protection: OFF")
+            self.protection_status_label.setText("Protección: ACTIVADA" if protection_on else "Protección: DESACTIVADA")
 
     def update_anomaly_display(self, anomaly_message):
-        self.anomaly_label.setText("Network Anomaly Detected")
+        self.anomaly_label.setText("Anomalía de red detectada")
 
         lines = anomaly_message.splitlines()
         alert_type = "Anomaly"
-        attacker = "Unknown"
-        victim = "Unknown"
+        attacker = "Desconocido"
+        victim = "Desconocido"
         status = "Detected"
         severity = "LOW"
 
