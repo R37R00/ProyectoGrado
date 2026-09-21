@@ -7,13 +7,24 @@ from tkinter.scrolledtext import ScrolledText
 class PacketView(ttk.Frame):
     MAX_ROWS = 1000
 
-    def __init__(self, parent, on_pause, on_resume, on_stop, on_unblock_host=None, on_block_host=None):
+    def __init__(
+            self,
+            parent,
+            on_pause,
+            on_resume,
+            on_stop,
+            on_unblock_host=None,
+            on_block_host=None,
+            on_configure_response=None,
+    ):
         super().__init__(parent, style="App.TFrame")
         self.on_pause = on_pause
         self.on_resume = on_resume
         self.on_stop = on_stop
         self.on_unblock_host = on_unblock_host
         self.on_block_host = on_block_host
+        self.on_configure_response = on_configure_response
+        self.response_available = False
         self.packet_rows = deque()
         self.host_state_by_ip = {}
         self.alert_rows = deque()
@@ -97,6 +108,14 @@ class PacketView(ttk.Frame):
         self.resume_button = ttk.Button(controls, text="Reanudar", style="Secondary.TButton", command=self.on_resume)
         self.resume_button.pack(side="left", padx=8)
         self.stop_button = ttk.Button(controls, text="Detener", style="Primary.TButton", command=self.on_stop)
+        self.configure_response_button = ttk.Button(
+            controls,
+            text="Configurar respuesta",
+            style="Secondary.TButton",
+            command=self._request_configure_response,
+            state="normal" if self.on_configure_response is not None else "disabled",
+        )
+        self.configure_response_button.pack(side="left", padx=(8, 0))
         self.stop_button.pack(side="left")
 
         status_bar = ttk.Frame(outer, style="Card.TFrame")
@@ -375,7 +394,16 @@ class PacketView(ttk.Frame):
 
         self.tree.yview_moveto(1.0)
 
+    def set_response_available(self, available):
+        self.response_available = bool(available)
+        self._on_host_selected()
+
     def _on_host_selected(self, _event=None):
+        if not self.response_available:
+            self.unblock_button.configure(state="disabled")
+            self.block_button.configure(state="disabled")
+            return
+
         if self.on_unblock_host is None and self.on_block_host is None:
             self.unblock_button.configure(state="disabled")
             self.block_button.configure(state="disabled")
@@ -394,9 +422,15 @@ class PacketView(ttk.Frame):
 
         selected_host = self.host_state_by_ip.get(selected_ip, {})
         is_blocked = bool(selected_host.get("is_blocked", False))
+
         if self.on_block_host is not None:
-            self.block_button.configure(state="disabled" if is_blocked else "normal")
-        self.unblock_button.configure(state="normal" if is_blocked else "disabled")
+            self.block_button.configure(
+                state="disabled" if is_blocked else "normal"
+            )
+
+        self.unblock_button.configure(
+            state="normal" if is_blocked else "disabled"
+        )
 
     def _request_block(self):
         selected_ip = self.get_selected_host_ip()
@@ -407,6 +441,10 @@ class PacketView(ttk.Frame):
         selected_ip = self.get_selected_host_ip()
         if selected_ip and self.on_unblock_host is not None:
             self.on_unblock_host(selected_ip)
+
+    def _request_configure_response(self):
+        if self.on_configure_response is not None:
+            self.on_configure_response()
 
     def get_selected_host_ip(self):
         selection = self.hosts_tree.selection()

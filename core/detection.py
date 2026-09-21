@@ -1,4 +1,6 @@
 import socket
+import logging
+
 from dataclasses import dataclass
 
 from scapy.all import conf, get_if_hwaddr, getmacbyip
@@ -96,6 +98,48 @@ class DetectionService:
             protected_ips=protected_ips,
             protected_macs=protected_macs,
         )
+
+    def add_protected_ip(self, ip_address):
+        logging.info("[DEBUG PROTECTION] Entró a add_protected_ip: %s", ip_address)
+
+        normalized_ip = self._normalize_ip(ip_address)
+        logging.info(
+            "[DEBUG PROTECTION] IP normalizada: %s",
+            normalized_ip,
+        )
+
+        if not normalized_ip:
+            logging.info("[DEBUG PROTECTION] IP inválida, retornando")
+            return
+
+        logging.info("[DEBUG PROTECTION] Obteniendo block_whitelist")
+
+        protected_ips = set(self.engine.block_whitelist)
+
+        logging.info(
+            "[DEBUG PROTECTION] Whitelist actual: %s",
+            sorted(protected_ips),
+        )
+
+        protected_ips.add(normalized_ip)
+
+        logging.info(
+            "[DEBUG PROTECTION] Whitelist nueva: %s",
+            sorted(protected_ips),
+        )
+
+        logging.info("[DEBUG PROTECTION] Ejecutando set_whitelist")
+
+        self.engine.set_whitelist(protected_ips)
+
+        logging.info("[DEBUG PROTECTION] set_whitelist terminó")
+
+        logging.info(
+            "[PROTECTION] IP protegidas actualmente: %s",
+            sorted(self.engine.block_whitelist),
+        )
+
+        logging.info("[DEBUG PROTECTION] add_protected_ip terminó")
 
     def build_baseline(self, interface_network=None):
         self.engine.build_arp_baseline(network_cidr=str(interface_network) if interface_network else None)

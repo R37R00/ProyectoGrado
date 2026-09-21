@@ -12,7 +12,7 @@ from scapy.layers.inet import ICMP, IP, TCP
 from event_logger import log_debug, log_event
 
 
-DEBUG = False
+DEBUG = True
 traffic_stats = {}
 
 DOS_WINDOW_SECONDS = 3
@@ -337,6 +337,7 @@ class DetectionEngine:
             lock_gateway_enabled=lock_gateway_enabled,
             aggressive_mode=aggressive_mode,
         )
+        
 
     def configure_dos_thresholds(
         self,
@@ -869,7 +870,13 @@ class DetectionEngine:
             logging.debug(message)
             log_debug(message)
 
-    def handle_attack(self, ip_address, mac_address, attack_type, victim_ip=None):
+    def handle_attack(self,
+                      ip_address,
+                      mac_address,
+                      attack_type,
+                      victim_ip=None,
+                      check_mac_whitelist=True
+    ):
         normalized_ip = str(ip_address).strip() if ip_address else None
         normalized_mac = self._normalize_mac(mac_address)
         normalized_victim_ip = str(victim_ip).strip() if victim_ip else None
@@ -883,7 +890,7 @@ class DetectionEngine:
             self._log_dos_debug(f"[DEBUG] Skipping protected IP: {normalized_ip}")
             return False
 
-        if self._is_mac_whitelisted(normalized_mac):
+        if check_mac_whitelist and self._is_mac_whitelisted(normalized_mac):
             return False
 
         logging.info(
@@ -913,6 +920,15 @@ class DetectionEngine:
         return False
 
     def detect_dos(self, ip_address, packet, current_time=None, pps=None, bps=None):
+        logging.warning(
+            "[TEST DOS] ip=%s pps=%s bps=%s profile=%s victim=%s",
+            ip_address,
+            pps,
+            bps,
+            self._get_dos_profile(packet)[0],
+            packet[IP].dst if packet.haslayer(IP) else None,
+        )
+
         normalized_ip = str(ip_address).strip() if ip_address else None
         victim_ip = str(packet[IP].dst).strip() if packet.haslayer(IP) and packet[IP].dst else None
         attack_key, attack_profile = self._get_dos_profile(packet)
@@ -930,10 +946,26 @@ class DetectionEngine:
             self._log_dos_debug(f"[DEBUG] Skipping protected IP: {normalized_ip}")
             return
 
-        if self._is_mac_whitelisted(attacker_mac):
-            return
+        logging.warning(
+            "[TEST DOS] WHITELIST MAC IGNORADA PARA DOS ip=%s mac=%s",
+            normalized_ip,
+            attacker_mac,
+        )
 
         now = current_time or time.time()
+
+        with self.state_lock:
+            existing_ip_state = self.dos_state.get(normalized_ip, {})
+            existing_attack_state = existing_ip_state.get(attack_key)
+
+            if (
+                    existing_attack_state
+                    and existing_attack_state.get("response_attempted", False)
+                    and now - existing_attack_state.get("last_seen", 0) <= self.dos_event_reset_s
+            ):
+                existing_attack_state["last_seen"] = now
+                return
+
         if pps is None or bps is None:
             calculated_pps, calculated_bps = self.calculate_rates(normalized_ip, current_time=now)
             if pps is None:
@@ -942,11 +974,30 @@ class DetectionEngine:
                 bps = calculated_bps
 
         target_pps, target_bps = self.calculate_target_rates(normalized_ip, victim_ip, current_time=now)
+        logging.warning(
+            "[TEST DOS] TARGET RATES ip=%s victim=%s pps=%.2f bps=%.2f",
+            normalized_ip,
+            victim_ip,
+            target_pps,
+            target_bps,
+        )
+
         if self._is_likely_port_scan(normalized_ip, victim_ip):
+            logging.warning(
+                "[TEST DOS] RECHAZADO: clasificado como PORT_SCAN src=%s dst=%s",
+                normalized_ip,
+                victim_ip,
+            )
             self._log_dos_debug(
                 f"[DEBUG] Attack classified as PORT_SCAN src={normalized_ip} dst={victim_ip}"
             )
             return
+
+        logging.warning(
+            "[TEST DOS] PASO PORT_SCAN src=%s dst=%s",
+            normalized_ip,
+            victim_ip,
+        )
 
         alert_pps = float(attack_profile.get("alert_pps", 0))
         block_pps = float(attack_profile.get("block_pps", 0))
@@ -981,6 +1032,7 @@ class DetectionEngine:
                     "blocked": False,
                 }
                 ip_state[attack_key] = attack_state
+                self.suspicious_count[normalized_ip] = 0
 
             attack_state["last_seen"] = now
 
@@ -993,7 +1045,13 @@ class DetectionEngine:
                 should_alert = True
 
             if block_condition:
-                self.suspicious_count[normalized_ip] = self.suspicious_count.get(normalized_ip, 0) + 1
+                ip_state = self.dos_state.setdefault(normalized_ip, {})
+                attack_state = ip_state.setdefault(attack_key, {})
+
+                if not attack_state.get("response_attempted", False):
+                    self.suspicious_count[normalized_ip] = (
+                            self.suspicious_count.get(normalized_ip, 0) + 1
+                    )
 
             suspicious_count = self.suspicious_count.get(normalized_ip, 0)
 
@@ -1026,11 +1084,54 @@ class DetectionEngine:
             f"[DEBUG] PPS={target_pps:.2f}, BPS={target_bps:.2f}, suspicious_count={suspicious_count} ip={normalized_ip}"
         )
 
-        if block_condition and suspicious_count >= self.dos_min_suspicious_events:
-            self._log_dos_debug(f"[DEBUG] Blocking condition met for {normalized_ip}")
-            self.handle_dos_attack(normalized_ip, packet, attack_key, attack_profile, target_pps, target_bps)
+        logging.warning(
+            "[TEST DOS] BLOCK CHECK ip=%s block_condition=%s suspicious_count=%s threshold=%s",
+            normalized_ip,
+            block_condition,
+            suspicious_count,
+            self.dos_min_suspicious_events,
+        )
 
-    def handle_dos_attack(self, ip_address, packet, attack_key, attack_profile, pps=None, bps=None):
+        with self.state_lock:
+            ip_state = self.dos_state.get(normalized_ip, {})
+            attack_state = ip_state.get(attack_key, {})
+            response_attempted = bool(attack_state.get("response_attempted", False))
+
+        if (
+                block_condition
+                and suspicious_count >= self.dos_min_suspicious_events
+                and not response_attempted
+        ):
+            self._log_dos_debug(f"[DEBUG] Blocking condition met for {normalized_ip}")
+
+            with self.state_lock:
+                ip_state = self.dos_state.setdefault(normalized_ip, {})
+                attack_state = ip_state.setdefault(attack_key, {})
+                attack_state["response_attempted"] = True
+
+            self.handle_dos_attack(
+                normalized_ip,
+                packet,
+                attack_key,
+                attack_profile,
+                target_pps,
+                target_bps,
+            )
+
+    def handle_dos_attack(self,
+                          ip_address,
+                          packet,
+                          attack_key,
+                          attack_profile,
+                          pps=None,
+                          bps=None):
+
+        logging.warning(
+            "[TEST DOS] ENTER handle_dos_attack ip=%s attack=%s",
+            ip_address,
+            attack_profile.get("label") if attack_profile else None,
+        )
+
         normalized_ip = str(ip_address).strip() if ip_address else None
         victim_ip = str(packet[IP].dst).strip() if packet.haslayer(IP) and packet[IP].dst else None
         if not normalized_ip:
@@ -1047,10 +1148,6 @@ class DetectionEngine:
             logging.info("IP %s protegida/en whitelist: se omite bloqueo por DoS", normalized_ip)
             return False
 
-        if self._is_mac_whitelisted(attacker_mac):
-            logging.info("MAC %s en whitelist: se omite bloqueo por DoS", attacker_mac)
-            return False
-
         try:
             if DEBUG:
                 log_debug(f"[ATTACK TYPE] Detected {attack_profile['label']} from {normalized_ip}")
@@ -1060,6 +1157,7 @@ class DetectionEngine:
                 attacker_mac,
                 attack_profile["label"],
                 victim_ip=victim_ip,
+                check_mac_whitelist = False,
             )
             if result is True:
                 with self.state_lock:
@@ -1068,19 +1166,6 @@ class DetectionEngine:
                     ip_state.setdefault(attack_key, {})["blocked"] = True
 
                 logging.warning("[BLOCK] DoS attacker blocked: %s", normalized_ip)
-                self.trigger_alert(
-                    "\n".join(
-                        [
-                            f"[BLOCK] DoS attacker blocked: {normalized_ip}",
-                            f"Attacker IP: {normalized_ip}",
-                            f"Victim IP: {victim_ip or 'unknown'}",
-                            f"Attacker MAC: {attacker_mac or 'unknown'}",
-                            f"Attack Type: {attack_profile['label']}",
-                            f"PPS: {pps:.2f}" if pps is not None else "PPS: unknown",
-                            f"BPS: {bps:.2f}" if bps is not None else "BPS: unknown",
-                        ]
-                    )
-                )
                 return True
         except Exception as error:
             logging.error(
@@ -1194,25 +1279,6 @@ class DetectionEngine:
                 f"[SCAN DETECT] src_ip={attacker_ip} flags=0x{tcp_flags:02x} "
                 f"ports_scanned={ports_scanned}"
             )
-
-        if scan_type:
-            self.trigger_alert(
-                f"{scan_type} detected from {attacker_ip}"
-                f"{f' to {target_ip}:{dst_port}' if target_ip else ''}"
-            )
-
-        if len(ports_scanned) >= self.port_scan_threshold:
-            logging.warning(
-                "[SCAN DETECT] src_ip=%s flags=0x%02x ports_scanned=%s",
-                attacker_ip,
-                tcp_flags,
-                ports_scanned,
-            )
-            self.trigger_alert(
-                f"Port scan detected from {attacker_ip} "
-                f"({len(ports_scanned)} unique ports in {self.port_scan_window_s}s)"
-            )
-            self._handle_port_scan(attacker_ip, target_ip, ports_scanned)
 
     def reset_host_state(self, ip_address):
         normalized_ip = str(ip_address).strip() if ip_address else None
@@ -1531,6 +1597,13 @@ class DetectionEngine:
         attacker_ip = str(attacker_ip).strip() if attacker_ip else None
         target_ip = str(target_ip).strip() if target_ip else None
         detection_key = (attacker_ip, target_ip)
+
+        self._log_port_scan_debug(
+            f"[PORT SCAN STATE] key={detection_key} "
+            f"already_detected={detection_key in self.detected_port_scanners} "
+            f"detected={self.detected_port_scanners}"
+        )
+
         sorted_ports = sorted({int(port) for port in ports if port is not None})
 
         self._log_port_scan_debug(
@@ -1556,6 +1629,23 @@ class DetectionEngine:
             )
             logging.info("IP %s en whitelist: se omite bloqueo por port scan", attacker_ip)
             return
+
+        with self.state_lock:
+            if detection_key in self.detected_port_scanners:
+                self._log_port_scan_debug(
+                    f"[PORT SCAN] Skipping duplicate detection "
+                    f"attacker={attacker_ip} target={target_ip or 'unknown'}"
+                )
+                return
+
+            self._log_port_scan_debug(
+                f"[PORT SCAN STATE] ADD key={detection_key}"
+            )
+            self.detected_port_scanners.add(detection_key)
+
+            self._log_port_scan_debug(
+                f"[PORT SCAN STATE] ADD COMPLETE key={detection_key}"
+            )
 
         port_preview = ", ".join(str(port) for port in sorted_ports[:10])
         if len(sorted_ports) > 10:
@@ -1662,10 +1752,11 @@ class DetectionEngine:
         ip_mac_changed = expected_mac != sender_mac
         mac_claims_multiple_ips = sender_mac in self.mac_table and sender_ip not in self.mac_table[sender_mac]
 
-        if DEBUG:
+        if DEBUG and (ip_mac_changed or mac_claims_multiple_ips):
             log_debug(
-                f"ARP mismatch detected: sender_ip={sender_ip} expected_mac={expected_mac} "
-                f"detected_mac={sender_mac} target_ip={target_ip or 'unknown'}"
+                f"ARP inconsistency detected: sender_ip={sender_ip} "
+                f"expected_mac={expected_mac} detected_mac={sender_mac} "
+                f"target_ip={target_ip or 'unknown'}"
             )
 
         if not ip_mac_changed and not mac_claims_multiple_ips:
@@ -1846,7 +1937,6 @@ class DetectionEngine:
                     f"ARP mismatch detected: {sender_ip} changed MAC "
                     f"{self._normalize_mac(previous_mac)} -> {sender_mac}"
                 )
-                log_event(f"ARP spoofing detected for {sender_ip}", "alert")
                 attack_info = self._build_complete_attack_context(
                     claimed_ip=sender_ip,
                     target_ip=target_ip,
@@ -1863,17 +1953,38 @@ class DetectionEngine:
                         sender_mac,
                         attacker_ip,
                     )
+
                 self._store_attack_context(attack_info)
+
                 if attacker_ip is None:
-                    logging.warning("Spoof detectado pero sin IP real para MAC atacante %s", sender_mac)
-                else:
-                    self.handle_arp_attack(
-                        attacker_ip,
+                    logging.warning(
+                        "Spoof detectado pero sin IP real para MAC atacante %s",
                         sender_mac,
-                        spoofed_ip=sender_ip,
-                        victim_ip=target_ip,
-                        attack_context=attack_info,
                     )
+                else:
+                    arp_attack_key = (str(attacker_ip).strip(), sender_mac)
+
+                    if arp_attack_key in self.detected_arp_attacks:
+                        logging.debug(
+                            "ARP spoofing ya procesado: attacker=%s mac=%s",
+                            attacker_ip,
+                            sender_mac,
+                        )
+                    else:
+                        self.detected_arp_attacks.add(arp_attack_key)
+
+                        log_event(
+                            f"ARP spoofing detected for {sender_ip}",
+                            "alert",
+                        )
+
+                        self.handle_arp_attack(
+                            attacker_ip,
+                            sender_mac,
+                            spoofed_ip=sender_ip,
+                            victim_ip=target_ip,
+                            attack_context=attack_info,
+                        )
 
             self.arp_table[sender_ip] = sender_mac
             self._update_mac_table(sender_ip, sender_mac, previous_mac)

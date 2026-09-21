@@ -26,7 +26,7 @@ from ui.router_config import RouterConfigView
 
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
@@ -71,6 +71,8 @@ class AppController:
         self.deferred_events = []
         self.startup_token = 0
         self.connection_timeout_job = None
+        self.response_in_progress = False
+        self.response_token = 0
         self.worker_stop_event = threading.Event()
         self.queue_drop_notice_at = 0.0
 
@@ -147,6 +149,12 @@ class AppController:
             self.detection_service = None
             self.mikrotik_manager = None
 
+
+    def _reset_monitoring_services(self):
+        with self.services_lock:
+            self.capture_service = None
+            self.detection_service = None
+
     def _cleanup_services(self, capture_service=None, mikrotik_manager=None):
         if capture_service is not None:
             try:
@@ -169,17 +177,10 @@ class AppController:
         self.interface_view.populate_interfaces(interfaces)
         self._set_view(self.interface_view)
 
+#Desde acá
     def _handle_interface_selected(self, interface_info):
         self.selected_interface = interface_info
-        defaults = get_active_mikrotik_config() or load_mikrotik_config_from_env()
-        self.router_view = RouterConfigView(
-            self.container,
-            interface_info=interface_info,
-            defaults=defaults,
-            on_accept=self._begin_startup,
-            on_cancel=self._cancel_startup,
-        )
-        self._set_view(self.router_view)
+        self._begin_monitoring_startup(interface_info)# Hasta acá
 
     def _validate_router_config(self, values):
         host_value = (values.get("host") or "").strip()
@@ -212,6 +213,54 @@ class AppController:
             password=password,
             port=port_value,
         ).normalized()
+
+    def _begin_monitoring_startup(self, interface_info):
+        if self.startup_in_progress:
+            return
+
+        if not interface_info:
+            messagebox.showerror(
+                "Interfaz",
+                "Selecciona una interfaz de red antes de continuar"
+            )
+            self.show_interface_selection()
+            return
+
+        self.startup_token += 1
+        startup_token = self.startup_token
+        self.startup_in_progress = True
+
+        self._reset_monitoring_services()
+
+        logging.info(
+            "[UI] Starting monitoring startup for interface: %s",
+            interface_info.identifier,
+        )
+
+        self._show_packet_view(
+            {
+                "interface": interface_info,
+                "interface_ip": interface_info.ip_address or "N/D",
+                "interface_network": "Inicializando...",
+            }
+        )
+
+        self.packet_view.set_mikrotik_status(
+            "No configurado",
+            connected=False,
+        )
+        self.packet_view.set_response_available(False)
+        self.packet_view.set_capture_status("Inicializando...")
+        self.packet_view.append_log(
+            f"[UI] Preparando monitorización en {interface_info.name} "
+            f"({interface_info.identifier})...",
+            level="info",
+        )
+
+        self.start_packet_capture(
+            startup_token,
+            interface_info,
+        )
 
     def _begin_startup(self, form_values):
         if self.startup_in_progress:
@@ -331,7 +380,7 @@ class AppController:
         messagebox.showerror("Error de conexión", error_message)
         self.show_interface_selection()
 
-    def _initialize_capture_worker(self, startup_token, interface_info, config, mikrotik_manager):
+    def _initialize_capture_worker(self, startup_token, interface_info):
         capture_service = None
         detection_service = None
         try:
@@ -347,17 +396,15 @@ class AppController:
                 interface_name=interface_info.identifier,
                 interface_ip=interface_ip,
                 interface_network=interface_network,
-                mikrotik_ip=config.host,
+                mikrotik_ip=None,
             )
-            mikrotik_manager.set_protected_hosts(protection.protected_ips, protection.protected_macs)
 
             with self.services_lock:
                 if startup_token != self.startup_token:
-                    self._cleanup_services(capture_service=capture_service, mikrotik_manager=mikrotik_manager)
+                    self._cleanup_services(capture_service=capture_service)
                     return
                 self.capture_service = capture_service
                 self.detection_service = detection_service
-                self.mikrotik_manager = mikrotik_manager
 
             if not capture_service.start(interface_info.identifier):
                 raise RuntimeError("No se pudo iniciar la captura de paquetes en la interfaz seleccionada.")
@@ -368,7 +415,6 @@ class AppController:
                     startup_token,
                     {
                         "interface": interface_info,
-                        "config": config,
                         "interface_ip": interface_ip or "N/D",
                         "interface_network": str(interface_network) if interface_network else "N/D",
                     },
@@ -384,11 +430,16 @@ class AppController:
                 ),
             )
         except Exception as error:
-            self._cleanup_services(capture_service=capture_service, mikrotik_manager=mikrotik_manager)
-            self._reset_runtime_services()
-            self.root.after(0, lambda: self._handle_capture_startup_failure(startup_token, str(error)))
+            self._cleanup_services(capture_service=capture_service)
+            self._reset_monitoring_services()
+            self.root.after(0,
+                            lambda: self._handle_capture_startup_failure(
+                                startup_token,
+                                str(error),
+                            ),
+                            )
 
-    def start_packet_capture(self, startup_token, interface_info, config, mikrotik_manager):
+    def start_packet_capture(self, startup_token, interface_info):
         logging.info("[CAPTURE] Scheduling packet capture startup for interface: %s", interface_info.identifier)
         if self.packet_view is not None:
             self.packet_view.set_capture_status("Iniciando captura...")
@@ -399,7 +450,7 @@ class AppController:
 
         worker = threading.Thread(
             target=self._initialize_capture_worker,
-            args=(startup_token, interface_info, config, mikrotik_manager),
+            args=(startup_token, interface_info),
             daemon=True,
         )
         worker.start()
@@ -411,8 +462,8 @@ class AppController:
         self.startup_in_progress = False
         self.packet_view.set_interface(startup_data["interface"].name, startup_data["interface_ip"])
         self.packet_view.set_mikrotik_status(
-            f"Conectado a {startup_data['config'].host}:{startup_data['config'].port}",
-            connected=True,
+            "No configurado",
+            connected=False,
         )
         self.packet_view.set_capture_status("En ejecución")
         self.packet_view.append_log(
@@ -1072,7 +1123,7 @@ class AppController:
             return False
 
         for network in getattr(detection_service.engine, "local_networks", []) or []:
-            if candidate == network.network_address or candidate == network.broadcast_address:
+            if candidate not in network:
                 return True
 
         return False
@@ -1100,10 +1151,216 @@ class AppController:
             self.router_view.set_busy(False, "", keep_cancel_enabled=True)
         self.show_interface_selection()
 
+    def _configure_response(self):
+        if self.packet_view is None:
+            return
+
+        defaults = get_active_mikrotik_config() or load_mikrotik_config_from_env()
+
+        self.router_view = RouterConfigView(
+            self.container,
+            interface_info=self.selected_interface,
+            defaults=defaults,
+            on_accept=self._begin_response_connection,
+            on_cancel=self._cancel_response_configuration,
+        )
+
+        self.packet_view.pack_forget()
+        self.current_view = self.router_view
+        self.router_view.pack(fill="both", expand=True)
+
+    def _begin_response_connection(self, form_values):
+        if self.packet_view is None:
+            return
+
+        try:
+            config = self._validate_router_config(form_values)
+        except ValueError as error:
+            self.router_view.set_message(str(error), is_error=True)
+            return
+
+        self.response_token += 1
+        response_token = self.response_token
+        self.response_in_progress = True
+
+        logging.info("[UI] Starting MikroTik response connection thread")
+
+        self.router_view.set_busy(
+             True,
+             "Conectando con MikroTik...",
+             keep_cancel_enabled=True,
+        )
+
+        worker = threading.Thread(
+            target=self._connect_response_worker,
+            args=(response_token, config),
+            daemon=True,
+        )
+        worker.start()
+
+    def _connect_response_worker(self, response_token, config):
+        mikrotik_manager = None
+
+        try:
+            mikrotik_manager = MikroTikManager(
+                host=config.host,
+                username=config.username,
+                password=config.password,
+                port=config.port,
+            )
+
+            success = mikrotik_manager.connect()
+
+            if response_token != self.response_token or not self.response_in_progress:
+                self._cleanup_services(mikrotik_manager=mikrotik_manager)
+                return
+
+            if not success:
+                raise RuntimeError(
+                    "No se pudo conectar con el router MikroTik. "
+                    "Revisa la IP, las credenciales y el puerto API."
+                )
+
+            self.root.after(
+                0,
+                lambda: self._handle_response_connection_success(
+                    response_token,
+                    config,
+                    mikrotik_manager,
+                ),
+            )
+
+        except Exception as error:
+            self._cleanup_services(mikrotik_manager=mikrotik_manager)
+
+            self.root.after(
+                0,
+                lambda: self._handle_response_connection_failed(
+                    response_token,
+                    str(error),
+                ),
+            )
+
+    def _handle_response_connection_success(self, response_token, config, mikrotik_manager):
+        logging.info("[DEBUG RESPONSE] Entró a _handle_response_connection_success")
+        logging.info(
+            "[DEBUG RESPONSE] token recibido=%s token actual=%s in_progress=%s",
+            response_token,
+            self.response_token,
+            self.response_in_progress,
+        )
+
+        if response_token != self.response_token or not self.response_in_progress:
+            logging.info("[DEBUG RESPONSE] Callback invalidado por token/estado")
+            self._cleanup_services(mikrotik_manager=mikrotik_manager)
+            return
+
+        self.response_in_progress = False
+        logging.info("[DEBUG RESPONSE] Estado de conexión validado")
+
+        with self.services_lock:
+            self.mikrotik_manager = mikrotik_manager
+
+        logging.info("[DEBUG RESPONSE] mikrotik_manager asignado")
+
+        set_active_mikrotik_config(config)
+        logging.info("[DEBUG RESPONSE] configuración guardada")
+
+        if self.detection_service is not None:
+            logging.info(
+                "[DEBUG RESPONSE] Agregando MikroTik a whitelist: %s",
+                config.host,
+            )
+            self.detection_service.add_protected_ip(config.host)
+            logging.info("[DEBUG RESPONSE] MikroTik agregado a whitelist")
+
+        logging.info("[DEBUG RESPONSE] Antes de UI success")
+
+        logging.info("[UI] MikroTik response connection successful")
+
+        self.ui_queue.put(
+            {
+                "type": "status",
+                "data": {
+                    "text": "Conectado",
+                    "connected": True,
+                },
+            }
+        )
+
+        logging.info("[DEBUG RESPONSE] ui_queue actualizado")
+
+        if self.packet_view is not None:
+            self.packet_view.set_response_available(True)
+            logging.info("[DEBUG RESPONSE] response_available actualizado")
+
+        self._append_runtime_log(
+            "[UI] Conexión con MikroTik establecida. "
+            "La respuesta ante amenazas está disponible.",
+            level="info",
+        )
+
+        logging.info("[DEBUG RESPONSE] runtime log actualizado")
+
+        self._set_view(self.packet_view)
+
+        logging.info("[DEBUG RESPONSE] Vista packet_view establecida")
+
+    def _handle_response_connection_failed(self, response_token, error_message):
+        if response_token != self.response_token:
+            return
+
+        self.response_in_progress = False
+
+        logging.error(
+            "[UI] MikroTik response connection failed: %s",
+            error_message,
+        )
+
+        if self.router_view is not None:
+            self.router_view.set_busy(
+                False,
+                "",
+                keep_cancel_enabled=True,
+            )
+
+        messagebox.showerror(
+            "Error de conexión",
+            error_message,
+        )
+
+        if self.packet_view is not None:
+            self.packet_view.set_mikrotik_status(
+                "No configurado",
+                connected=False,
+            )
+            self.packet_view.set_response_available(False)
+
+            self.packet_view.append_log(
+                "No se pudo establecer la conexión con MikroTik. "
+                "La monitorización continúa funcionando.",
+                level="error",
+            )
+            self._set_view(self.packet_view)
+
+    def _cancel_response_configuration(self):
+        self.response_token += 1
+        self.response_in_progress = False
+
+        logging.info("[UI] MikroTik response configuration cancelled")
+
+        if self.router_view is not None:
+            self.router_view.set_busy(
+                False,
+                "",
+                keep_cancel_enabled=True,
+            )
+
+        if self.packet_view is not None:
+            self._set_view(self.packet_view)
+
     def _show_packet_view(self, startup_data):
         interface_info = startup_data["interface"]
-        config = startup_data["config"]
-        set_active_mikrotik_config(config)
 
         self.packet_view = PacketView(
             self.container,
@@ -1112,9 +1369,10 @@ class AppController:
             on_stop=self.stop_capture,
             on_unblock_host=self.unblock_host,
             on_block_host=self.block_host,
+            on_configure_response=self._configure_response
         )
         self.packet_view.set_interface(interface_info.name, startup_data["interface_ip"])
-        self.packet_view.set_mikrotik_status("Conectando...", connected=False)
+        self.packet_view.set_mikrotik_status("No configurado", connected=False)
         self.packet_view.set_capture_status("Inicializando...")
         self.packet_view.append_log(
             f"Preparando captura en {interface_info.name} ({interface_info.identifier})...",
@@ -1358,8 +1616,14 @@ class AppController:
                 elif task_type == "log":
                     self.deferred_events.append(task)
                 elif task_type == "status" and self.packet_view is not None:
+                    connected = bool(task_data.get("connected"))
                     text = task_data.get("text", "Desconectado")
-                    self.packet_view.set_mikrotik_status(text, connected=bool(task_data.get("connected")))
+
+                    self.packet_view.set_mikrotik_status(
+                        text,
+                        connected=connected,
+                    )
+                    self.packet_view.set_response_available(connected)
                 elif task_type == "status":
                     self.deferred_events.append(task)
         except queue.Empty:

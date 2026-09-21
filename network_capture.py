@@ -9,7 +9,7 @@ from scapy.all import ARP, Ether, sniff, srp
 from event_logger import log_debug
 
 
-DEBUG = False
+DEBUG = True
 
 class NetworkCaptureScanner:
     def __init__(self, packet_callback, hosts_callback, interface=None):
