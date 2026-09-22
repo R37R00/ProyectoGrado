@@ -102,17 +102,89 @@ class IDSConfigView(ttk.Frame):
             style="Muted.TLabel",
             wraplength=1050,
             justify="left",
-        ).pack(anchor="w", pady=(6, 18))
+        ).pack(anchor="w", pady=(6, 12))
 
-        content = ttk.Frame(outer, style="Panel.TFrame", padding=14)
-        content.pack(fill="both", expand=True)
+        # Área desplazable para las opciones de configuración.
+        content_container = ttk.Frame(
+            outer,
+            style="Panel.TFrame",
+        )
+        content_container.pack(
+            fill="both",
+            expand=True,
+        )
+
+        canvas = tk.Canvas(
+            content_container,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            content_container,
+            orient="vertical",
+            command=canvas.yview,
+        )
+
+        content = ttk.Frame(
+            canvas,
+            style="Panel.TFrame",
+            padding=14,
+        )
+
+        content_window = canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+
+        canvas.configure(
+            yscrollcommand=scrollbar.set,
+        )
+
+        canvas.pack(
+            side="left",
+            fill="both",
+            expand=True,
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y",
+        )
+
+        def _update_scroll_region(_event=None):
+            canvas.configure(
+                scrollregion=canvas.bbox("all"),
+            )
+
+        def _resize_content(event):
+            canvas.itemconfigure(
+                content_window,
+                width=event.width,
+            )
+
+        content.bind(
+            "<Configure>",
+            _update_scroll_region,
+        )
+
+        canvas.bind(
+            "<Configure>",
+            _resize_content,
+        )
 
         self._build_detection_section(content)
         self._build_dos_section(content)
         self._build_mitigation_section(content)
 
-        footer = ttk.Frame(outer, style="Card.TFrame")
-        footer.pack(fill="x", pady=(14, 0))
+        footer = ttk.Frame(
+            outer,
+            style="Card.TFrame",
+        )
+        footer.pack(
+            fill="x",
+            pady=(12, 0),
+        )
 
         ttk.Label(
             footer,
@@ -122,7 +194,7 @@ class IDSConfigView(ttk.Frame):
 
         ttk.Button(
             footer,
-            text="Cancelar",
+            text="Volver",
             style="Secondary.TButton",
             command=self.on_cancel,
         ).pack(side="right")

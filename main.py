@@ -1235,20 +1235,6 @@ class AppController:
         if self.packet_view is not None:
             self._set_view(self.packet_view)
 
-        defaults = get_active_mikrotik_config() or load_mikrotik_config_from_env()
-
-        self.router_view = RouterConfigView(
-            self.container,
-            interface_info=self.selected_interface,
-            defaults=defaults,
-            on_accept=self._begin_response_connection,
-            on_cancel=self._cancel_response_configuration,
-        )
-
-        self.packet_view.pack_forget()
-        self.current_view = self.router_view
-        self.router_view.pack(fill="both", expand=True)
-
     def _begin_response_connection(self, form_values):
         if self.packet_view is None:
             return
