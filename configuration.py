@@ -17,3 +17,7 @@ def load_ids_config():
 
 def get_ids_config_path():
     return CONFIG_PATH
+
+def save_ids_config(config):
+    with CONFIG_PATH.open("w", encoding="utf-8") as file:
+        json.dump(config, file, indent=4, ensure_ascii=False)

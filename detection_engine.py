@@ -337,7 +337,20 @@ class DetectionEngine:
             lock_gateway_enabled=lock_gateway_enabled,
             aggressive_mode=aggressive_mode,
         )
-        
+
+    def configure_arp_thresholds(self, suspicion_window_s=None, suspicion_threshold=None):
+        if suspicion_window_s is not None and suspicion_window_s > 0:
+            self.arp_suspicion_window_s = float(suspicion_window_s)
+
+        if suspicion_threshold is not None and suspicion_threshold > 0:
+            self.arp_suspicion_threshold = int(suspicion_threshold)
+
+    def configure_port_scan_thresholds(self, window_s=None, threshold=None):
+        if window_s is not None and window_s > 0:
+            self.port_scan_window_s = float(window_s)
+
+        if threshold is not None and threshold > 0:
+            self.port_scan_threshold = int(threshold)
 
     def configure_dos_thresholds(
         self,

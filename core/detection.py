@@ -7,6 +7,8 @@ from scapy.all import conf, get_if_hwaddr, getmacbyip
 
 from detection_engine import DetectionEngine
 
+from configuration import load_ids_config
+
 
 @dataclass(frozen=True)
 class ProtectionContext:
@@ -19,15 +21,11 @@ class ProtectionContext:
 
 class DetectionService:
     def __init__(self, alert_callback, block_callback):
+        self.config = load_ids_config()
+
         self.engine = DetectionEngine()
         self.engine.set_alert_callback(alert_callback)
         self.engine.set_block_callback(block_callback)
-        self.engine.configure_mitigation(
-            mitigation_enabled=True,
-            periodic_enabled=False,
-            lock_gateway_enabled=False,
-            aggressive_mode=False,
-        )
 
     def _normalize_ip(self, value):
         if value is None:
@@ -158,3 +156,39 @@ class DetectionService:
 
     def reset_host_state(self, ip_address):
         self.engine.reset_host_state(ip_address)
+
+    def apply_configuration(self, config=None):
+        if config is None:
+            config = load_ids_config()
+
+        self.config = config
+
+        arp_config = config.get("arp", {})
+        port_scan_config = config.get("port_scan", {})
+        dos_config = config.get("dos", {})
+        mitigation_config = config.get("arp_mitigation", {})
+
+        self.engine.configure_arp_thresholds(
+            suspicion_window_s=arp_config.get("suspicion_window_s"),
+            suspicion_threshold=arp_config.get("suspicion_threshold"),
+        )
+
+        self.engine.configure_port_scan_thresholds(
+            window_s=port_scan_config.get("window_s"),
+            threshold=port_scan_config.get("threshold"),
+        )
+
+        self.engine.configure_dos_thresholds(
+            profiles=dos_config.get("profiles"),
+            window_s=dos_config.get("window_s"),
+            suspicious_events=dos_config.get("min_suspicious_events"),
+            alert_cooldown_s=dos_config.get("alert_cooldown_s"),
+            event_reset_s=dos_config.get("event_reset_s"),
+        )
+
+        self.engine.configure_mitigation(
+            mitigation_enabled=mitigation_config.get("enabled", True),
+            periodic_enabled=mitigation_config.get("periodic_enabled", False),
+            lock_gateway_enabled=mitigation_config.get("lock_gateway_enabled", False),
+            aggressive_mode=mitigation_config.get("aggressive_mode", False),
+        )

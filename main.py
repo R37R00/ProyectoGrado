@@ -12,6 +12,7 @@ from scapy.all import ARP, Ether, IP
 
 from core.capture import CaptureService, format_packet_record, list_available_interfaces
 from core.detection import DetectionService
+from configuration import load_ids_config, save_ids_config
 from event_logger import set_gui_event_callback
 from mikrotik_config import (
     MikroTikConfig,
@@ -23,6 +24,7 @@ from mikrotik_handler import MikroTikManager
 from ui.interface_selection import InterfaceSelectionView
 from ui.packet_view import PacketView
 from ui.router_config import RouterConfigView
+from ui.ids_config import IDSConfigView
 
 
 logging.basicConfig(
@@ -53,6 +55,7 @@ class AppController:
         self.interface_view = None
         self.router_view = None
         self.packet_view = None
+        self.ids_config_view = None
         self.selected_interface = None
         self.packet_counter = 0
         self.packet_counter_lock = threading.Lock()
@@ -1169,6 +1172,83 @@ class AppController:
         self.current_view = self.router_view
         self.router_view.pack(fill="both", expand=True)
 
+    def _configure_ids(self):
+        if self.packet_view is None:
+            return
+
+        try:
+            config = load_ids_config()
+        except Exception as error:
+            logging.error("[IDS CONFIG] Could not load configuration: %s", error)
+            self.packet_view.append_log(
+                f"No se pudo cargar la configuración del IDS: {error}",
+                level="error",
+            )
+            return
+        self.ids_config_view = IDSConfigView(
+            self.container,
+            config=config,
+            on_save=self._apply_ids_configuration,
+            on_cancel=self._cancel_ids_configuration,
+        )
+
+        self.packet_view.pack_forget()
+        self.current_view = self.ids_config_view
+        self.ids_config_view.pack(fill="both", expand=True)
+
+        logging.info("[UI] IDS configuration view opened")
+
+    def _apply_ids_configuration(self, config):
+        if self.detection_service is None:
+            self.ids_config_view.set_message(
+                "El servicio de detección no está disponible.",
+                is_error=True,
+            )
+            return
+
+        try:
+            save_ids_config(config)
+            self.detection_service.apply_configuration(config)
+
+            logging.info("[IDS CONFIG] Configuration saved and applied")
+
+            self.packet_view.append_log(
+                "[IDS] Configuración actualizada y aplicada sin reiniciar la captura.",
+                level="info",
+            )
+
+            self._set_view(self.packet_view)
+
+        except Exception as error:
+            logging.error(
+                "[IDS CONFIG] Could not save/apply configuration: %s",
+                error,
+            )
+            self.ids_config_view.set_message(
+                f"No se pudo guardar/aplicar la configuración: {error}",
+                is_error=True,
+            )
+
+    def _cancel_ids_configuration(self):
+        logging.info("[UI] IDS configuration cancelled")
+
+        if self.packet_view is not None:
+            self._set_view(self.packet_view)
+
+        defaults = get_active_mikrotik_config() or load_mikrotik_config_from_env()
+
+        self.router_view = RouterConfigView(
+            self.container,
+            interface_info=self.selected_interface,
+            defaults=defaults,
+            on_accept=self._begin_response_connection,
+            on_cancel=self._cancel_response_configuration,
+        )
+
+        self.packet_view.pack_forget()
+        self.current_view = self.router_view
+        self.router_view.pack(fill="both", expand=True)
+
     def _begin_response_connection(self, form_values):
         if self.packet_view is None:
             return
@@ -1369,7 +1449,8 @@ class AppController:
             on_stop=self.stop_capture,
             on_unblock_host=self.unblock_host,
             on_block_host=self.block_host,
-            on_configure_response=self._configure_response
+            on_configure_response=self._configure_response,
+            on_configure_ids=self._configure_ids,
         )
         self.packet_view.set_interface(interface_info.name, startup_data["interface_ip"])
         self.packet_view.set_mikrotik_status("No configurado", connected=False)

@@ -16,6 +16,7 @@ class PacketView(ttk.Frame):
             on_unblock_host=None,
             on_block_host=None,
             on_configure_response=None,
+            on_configure_ids=None,
     ):
         super().__init__(parent, style="App.TFrame")
         self.on_pause = on_pause
@@ -24,6 +25,7 @@ class PacketView(ttk.Frame):
         self.on_unblock_host = on_unblock_host
         self.on_block_host = on_block_host
         self.on_configure_response = on_configure_response
+        self.on_configure_ids = on_configure_ids
         self.response_available = False
         self.packet_rows = deque()
         self.host_state_by_ip = {}
@@ -116,6 +118,16 @@ class PacketView(ttk.Frame):
             state="normal" if self.on_configure_response is not None else "disabled",
         )
         self.configure_response_button.pack(side="left", padx=(8, 0))
+
+        self.configure_ids_button = ttk.Button(
+            controls,
+            text="Configurar IDS",
+            style="Secondary.TButton",
+            command=self._request_configure_ids,
+            state="normal" if self.on_configure_ids is not None else "disabled",
+        )
+        self.configure_ids_button.pack(side="left", padx=(8, 0))
+
         self.stop_button.pack(side="left")
 
         status_bar = ttk.Frame(outer, style="Card.TFrame")
@@ -445,6 +457,10 @@ class PacketView(ttk.Frame):
     def _request_configure_response(self):
         if self.on_configure_response is not None:
             self.on_configure_response()
+
+    def _request_configure_ids(self):
+        if self.on_configure_ids is not None:
+            self.on_configure_ids()
 
     def get_selected_host_ip(self):
         selection = self.hosts_tree.selection()
