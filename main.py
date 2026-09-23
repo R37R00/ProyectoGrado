@@ -1210,7 +1210,17 @@ class AppController:
             save_ids_config(config)
             self.detection_service.apply_configuration(config)
 
-            logging.info("[IDS CONFIG] Configuration saved and applied")
+            logging.info(
+                "[IDS CONFIG] Configuration saved and applied: "
+                "ARP window=%s | Port Scan window=%s threshold=%s | "
+                "DoS window=%s | ICMP block_pps=%s | SYN block_pps=%s",
+                self.detection_service.engine.arp_suspicion_window_s,
+                self.detection_service.engine.port_scan_window_s,
+                self.detection_service.engine.port_scan_threshold,
+                self.detection_service.engine.dos_window_s,
+                self.detection_service.engine.dos_profiles["icmp_flood"]["block_pps"],
+                self.detection_service.engine.dos_profiles["syn_flood"]["block_pps"],
+            )
 
             self.packet_view.append_log(
                 "[IDS] Configuración actualizada y aplicada sin reiniciar la captura.",

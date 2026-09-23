@@ -1,27 +1,27 @@
 {
     "arp": {
-        "suspicion_window_s": 2,
+        "suspicion_window_s": 2.0,
         "suspicion_threshold": 1
     },
     "port_scan": {
-        "window_s": 4,
+        "window_s": 4.0,
         "threshold": 6
     },
     "dos": {
-        "window_s": 3,
-        "alert_cooldown_s": 1,
+        "window_s": 3.0,
+        "alert_cooldown_s": 1.0,
         "min_suspicious_events": 2,
-        "event_reset_s": 2,
+        "event_reset_s": 2.0,
         "profiles": {
             "icmp_flood": {
-                "alert_pps": 4,
-                "block_pps": 8,
-                "block_bps": 12000
+                "alert_pps": 4.0,
+                "block_pps": 8.0,
+                "block_bps": 12000.0
             },
             "syn_flood": {
-                "alert_pps": 4,
-                "block_pps": 7,
-                "block_bps": 12000
+                "alert_pps": 4.0,
+                "block_pps": 7.0,
+                "block_bps": 12000.0
             }
         }
     },

@@ -1,6 +1,7 @@
 import tkinter as tk
-from tkinter import ttk
-
+import copy
+from tkinter import messagebox,ttk
+from configuration import DEFAULT_IDS_CONFIG
 
 class IDSConfigView(ttk.Frame):
     def __init__(self, parent, config, on_save, on_cancel):
@@ -190,6 +191,13 @@ class IDSConfigView(ttk.Frame):
             footer,
             textvariable=self.message_var,
             style="Muted.TLabel",
+        ).pack(side="left")
+
+        ttk.Button(
+            footer,
+            text="Restablecer valores",
+            style="Secondary.TButton",
+            command=self._reset_to_defaults,
         ).pack(side="left")
 
         ttk.Button(
@@ -553,3 +561,16 @@ class IDSConfigView(ttk.Frame):
     def set_message(self, message, is_error=False):
         prefix = "Error: " if is_error and message else ""
         self.message_var.set(f"{prefix}{message}" if message else "")
+
+    def _reset_to_defaults(self):
+        confirmed = messagebox.askyesno(
+            "Restablecer configuración",
+            "¿Restablecer todos los valores a su configuración predeterminada?",
+        )
+
+        if not confirmed:
+            return
+
+        self.config = copy.deepcopy(DEFAULT_IDS_CONFIG)
+        self._load_config_values()
+        self.message_var.set("Valores predeterminados restaurados.")
