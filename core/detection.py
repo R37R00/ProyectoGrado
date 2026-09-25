@@ -26,6 +26,7 @@ class DetectionService:
         self.engine = DetectionEngine()
         self.engine.set_alert_callback(alert_callback)
         self.engine.set_block_callback(block_callback)
+        self.apply_configuration(self.config)
 
     def _normalize_ip(self, value):
         if value is None:
