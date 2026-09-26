@@ -37,6 +37,13 @@ DEFAULT_IDS_CONFIG = {
         "lock_gateway_enabled": False,
         "aggressive_mode": False,
     },
+    "mitigation": {
+        "block_duration_s": 60.0,
+    },
+    "whitelist": {
+        "ips": [],
+        "macs": [],
+    },
 }
 
 def load_ids_config():

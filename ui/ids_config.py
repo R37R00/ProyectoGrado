@@ -35,16 +35,21 @@ class IDSConfigView(ttk.Frame):
         self.mitigation_enabled_var = tk.BooleanVar()
         self.periodic_enabled_var = tk.BooleanVar()
         self.lock_gateway_enabled_var = tk.BooleanVar()
+        self.block_duration_var = tk.StringVar()
         self.aggressive_mode_var = tk.BooleanVar()
+        self.whitelist_ips_var = tk.StringVar()
+        self.whitelist_macs_var = tk.StringVar()
 
         self._load_config_values()
         self._build_layout()
+        self._load_whitelist_values()
 
     def _load_config_values(self):
         arp_config = self.config.get("arp", {})
         port_scan_config = self.config.get("port_scan", {})
         dos_config = self.config.get("dos", {})
         mitigation_config = self.config.get("arp_mitigation", {})
+        block_mitigation_config = self.config.get("mitigation", {})
 
         icmp_config = dos_config.get("profiles", {}).get("icmp_flood", {})
         syn_config = dos_config.get("profiles", {}).get("syn_flood", {})
@@ -79,6 +84,23 @@ class IDSConfigView(ttk.Frame):
         )
         self.aggressive_mode_var.set(
             bool(mitigation_config.get("aggressive_mode", False))
+        )
+
+        self.block_duration_var.set(
+            str(block_mitigation_config.get("block_duration_s", 60.0))
+        )
+
+    def _load_whitelist_values(self):
+        whitelist_config = self.config.get("whitelist", {})
+
+        self.whitelist_ips_text.insert(
+            "1.0",
+            "\n".join(str(value) for value in whitelist_config.get("ips", [])),
+        )
+
+        self.whitelist_macs_text.insert(
+            "1.0",
+            "\n".join(str(value) for value in whitelist_config.get("macs", [])),
         )
 
     def _build_layout(self):
@@ -175,6 +197,7 @@ class IDSConfigView(ttk.Frame):
         )
 
         self._build_detection_section(content)
+        self._build_whitelist_section(content)
         self._build_dos_section(content)
         self._build_mitigation_section(content)
 
@@ -258,6 +281,58 @@ class IDSConfigView(ttk.Frame):
             1,
             "Umbral de puertos",
             self.port_threshold_var,
+        )
+
+    def _build_whitelist_section(self, parent):
+        whitelist_frame = ttk.LabelFrame(
+            parent,
+            text="Lista blanca",
+            style="Card.TLabelframe",
+            padding=12,
+        )
+        whitelist_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(
+            whitelist_frame,
+            text=(
+                "Hosts protegidos que no serán bloqueados automáticamente. "
+                "Ingresa una dirección por línea."
+            ),
+            style="Muted.TLabel",
+            wraplength=900,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(
+            whitelist_frame,
+            text="Direcciones IP",
+        ).pack(anchor="w")
+
+        self.whitelist_ips_text = tk.Text(
+            whitelist_frame,
+            height=5,
+            width=60,
+            wrap="none",
+        )
+        self.whitelist_ips_text.pack(
+            fill="x",
+            pady=(4, 10),
+        )
+
+        ttk.Label(
+            whitelist_frame,
+            text="Direcciones MAC",
+        ).pack(anchor="w")
+
+        self.whitelist_macs_text = tk.Text(
+            whitelist_frame,
+            height=5,
+            width=60,
+            wrap="none",
+        )
+        self.whitelist_macs_text.pack(
+            fill="x",
+            pady=(4, 0),
         )
 
     def _build_dos_section(self, parent):
@@ -387,6 +462,18 @@ class IDSConfigView(ttk.Frame):
             variable=self.aggressive_mode_var,
         ).pack(anchor="w", pady=3)
 
+        ttk.Label(
+            mitigation_frame,
+            text="Duración del bloqueo automático (segundos)",
+            style="Body.TLabel",
+        ).pack(anchor="w", pady=(12, 3))
+
+        ttk.Entry(
+            mitigation_frame,
+            textvariable=self.block_duration_var,
+            width=14,
+        ).pack(anchor="w", pady=(0, 3))
+
     def _add_entry_field(self, parent, row, label_text, variable):
         parent.columnconfigure(1, weight=1)
 
@@ -485,6 +572,23 @@ class IDSConfigView(ttk.Frame):
             "Block BPS de SYN debe ser mayor o igual a 0.",
         )
 
+        block_duration = self._positive_float(
+            self.block_duration_var.get(),
+            "La duración del bloqueo automático debe ser mayor que 0.",
+        )
+
+        whitelist_ips = [
+            value.strip()
+            for value in self.whitelist_ips_text.get("1.0", "end").splitlines()
+            if value.strip()
+        ]
+
+        whitelist_macs = [
+            value.strip().lower()
+            for value in self.whitelist_macs_text.get("1.0", "end").splitlines()
+            if value.strip()
+        ]
+
         config = {
             "arp": {
                 "suspicion_window_s": arp_window,
@@ -517,6 +621,13 @@ class IDSConfigView(ttk.Frame):
                 "periodic_enabled": self.periodic_enabled_var.get(),
                 "lock_gateway_enabled": self.lock_gateway_enabled_var.get(),
                 "aggressive_mode": self.aggressive_mode_var.get(),
+            },
+            "mitigation": {
+                "block_duration_s": block_duration,
+            },
+            "whitelist":{
+                "ips": whitelist_ips,
+                "macs": whitelist_macs,
             },
         }
 

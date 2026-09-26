@@ -23,6 +23,12 @@ class DetectionService:
     def __init__(self, alert_callback, block_callback):
         self.config = load_ids_config()
 
+        self.configured_whitelist_ips = set()
+        self.configured_whitelist_macs = set()
+
+        self.runtime_protected_ips = set()
+        self.runtime_protected_macs = set()
+
         self.engine = DetectionEngine()
         self.engine.set_alert_callback(alert_callback)
         self.engine.set_block_callback(block_callback)
@@ -39,6 +45,19 @@ class DetectionService:
             return None
         text = str(value).strip().lower()
         return text or None
+
+    def _apply_effective_whitelist(self):
+        effective_ips = (
+                set(self.configured_whitelist_ips)
+                | set(self.runtime_protected_ips)
+        )
+        effective_macs = (
+                set(self.configured_whitelist_macs)
+                | set(self.runtime_protected_macs)
+        )
+
+        self.engine.set_whitelist(effective_ips)
+        self.engine.set_mac_whitelist(effective_macs)
 
     def _resolve_gateway_ip(self):
         try:
@@ -78,6 +97,7 @@ class DetectionService:
             }
             if value
         }
+
         protected_macs = {
             value
             for value in {
@@ -87,8 +107,9 @@ class DetectionService:
             if value
         }
 
-        self.engine.set_whitelist(protected_ips)
-        self.engine.set_mac_whitelist(protected_macs)
+        self.runtime_protected_ips = protected_ips
+        self.runtime_protected_macs = protected_macs
+        self._apply_effective_whitelist()
 
         return ProtectionContext(
             interface_ip=self._normalize_ip(interface_ip),
@@ -99,46 +120,26 @@ class DetectionService:
         )
 
     def add_protected_ip(self, ip_address):
-        logging.info("[DEBUG PROTECTION] Entró a add_protected_ip: %s", ip_address)
+        logging.info("[DEBUG PROTECTION] Agregando IP protegida: %s", ip_address)
 
         normalized_ip = self._normalize_ip(ip_address)
-        logging.info(
-            "[DEBUG PROTECTION] IP normalizada: %s",
-            normalized_ip,
-        )
 
         if not normalized_ip:
             logging.info("[DEBUG PROTECTION] IP inválida, retornando")
             return
 
-        logging.info("[DEBUG PROTECTION] Obteniendo block_whitelist")
-
-        protected_ips = set(self.engine.block_whitelist)
-
-        logging.info(
-            "[DEBUG PROTECTION] Whitelist actual: %s",
-            sorted(protected_ips),
-        )
-
-        protected_ips.add(normalized_ip)
-
-        logging.info(
-            "[DEBUG PROTECTION] Whitelist nueva: %s",
-            sorted(protected_ips),
-        )
-
-        logging.info("[DEBUG PROTECTION] Ejecutando set_whitelist")
-
-        self.engine.set_whitelist(protected_ips)
-
-        logging.info("[DEBUG PROTECTION] set_whitelist terminó")
+        self.runtime_protected_ips.add(normalized_ip)
+        self._apply_effective_whitelist()
 
         logging.info(
             "[PROTECTION] IP protegidas actualmente: %s",
-            sorted(self.engine.block_whitelist),
+            sorted(self.runtime_protected_ips),
         )
 
-        logging.info("[DEBUG PROTECTION] add_protected_ip terminó")
+        logging.info(
+            "[PROTECTION] Whitelist efectiva: %s",
+            sorted(self.engine.block_whitelist),
+        )
 
     def build_baseline(self, interface_network=None):
         self.engine.build_arp_baseline(network_cidr=str(interface_network) if interface_network else None)
@@ -168,6 +169,7 @@ class DetectionService:
         port_scan_config = config.get("port_scan", {})
         dos_config = config.get("dos", {})
         mitigation_config = config.get("arp_mitigation", {})
+        whitelist_config = config.get("whitelist", {})
 
         self.engine.configure_arp_thresholds(
             suspicion_window_s=arp_config.get("suspicion_window_s"),
@@ -193,3 +195,17 @@ class DetectionService:
             lock_gateway_enabled=mitigation_config.get("lock_gateway_enabled", False),
             aggressive_mode=mitigation_config.get("aggressive_mode", False),
         )
+
+        self.configured_whitelist_ips = {
+            self._normalize_ip(value)
+            for value in whitelist_config.get("ips", [])
+            if self._normalize_ip(value)
+        }
+
+        self.configured_whitelist_macs = {
+            self._normalize_mac(value)
+            for value in whitelist_config.get("macs", [])
+            if self._normalize_mac(value)
+        }
+
+        self._apply_effective_whitelist()
