@@ -169,6 +169,10 @@ class DetectionService:
         port_scan_config = config.get("port_scan", {})
         dos_config = config.get("dos", {})
         mitigation_config = config.get("arp_mitigation", {})
+        block_duration_config = config.get("mitigation", {})
+        self.block_duration_s = float(
+            block_duration_config.get("block_duration_s", 60.0)
+        )
         whitelist_config = config.get("whitelist", {})
 
         self.engine.configure_arp_thresholds(

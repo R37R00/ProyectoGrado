@@ -586,7 +586,14 @@ class AppController:
                         victim_mac = victim_mac or attack.get("victim_mac")
                         break
 
-        block_result = bool(mikrotik_manager.block_attacker(ip_address, mac_address, attack_type=attack_type))
+        block_result = bool(
+            mikrotik_manager.block_attacker(
+                ip_address,
+                mac_address,
+                attack_type=attack_type,
+                block_duration_s=detection_service.block_duration_s if detection_service is not None else None,
+            )
+        )
         router_has_rules = False
         try:
             router_has_rules = bool(mikrotik_manager.is_ip_blocked_in_router(ip_address))
@@ -651,16 +658,106 @@ class AppController:
                 }
             )
 
-    def _execute_unblock_request(self, ip_address, mac_address=None):
+    def _execute_unblock_request(
+            self,
+            ip_address,
+            mac_address=None,
+            automatic_expiration=False,
+    ):
         with self.services_lock:
             mikrotik_manager = self.mikrotik_manager
+            detection_service = self.detection_service
+
         if mikrotik_manager is None:
+            if automatic_expiration:
+                logging.warning(
+                    "[MIKROTIK] No se pudo procesar la expiración de %s: "
+                    "router no disponible.",
+                    ip_address,
+                )
             return False
+
         if not mikrotik_manager.is_connected() and not mikrotik_manager.connect():
-            self.ui_queue.put({"type": "status", "data": {"text": "Desconectado", "connected": False}})
+            self.ui_queue.put(
+                {
+                    "type": "status",
+                    "data": {
+                        "text": "Desconectado",
+                        "connected": False,
+                    },
+                }
+            )
+
+            if automatic_expiration:
+                with mikrotik_manager.lock:
+                    tracker = mikrotik_manager.blocked_rules.get(ip_address)
+                    if tracker is not None:
+                        tracker["unblock_queued"] = False
+
+                self._append_runtime_log(
+                    f"No se pudo expirar el bloqueo automático de {ip_address}: "
+                    "el router no está disponible.",
+                    level="error",
+                )
+
             return False
-        self.ui_queue.put({"type": "status", "data": {"text": "Conectado", "connected": True}})
-        return bool(mikrotik_manager.unblock_attacker(ip_address, mac_address))
+
+        self.ui_queue.put(
+            {
+                "type": "status",
+                "data": {
+                    "text": "Conectado",
+                    "connected": True,
+                },
+            }
+        )
+
+        unblocked = bool(
+            mikrotik_manager.unblock_attacker(
+                ip_address,
+                mac_address,
+            )
+        )
+
+        if not unblocked:
+            if automatic_expiration:
+                with mikrotik_manager.lock:
+                    tracker = mikrotik_manager.blocked_rules.get(ip_address)
+                    if tracker is not None:
+                        tracker["unblock_queued"] = False
+
+                self._append_runtime_log(
+                    f"No se pudo retirar el bloqueo automático de {ip_address}. "
+                    "Se podrá reintentar la expiración.",
+                    level="error",
+                )
+
+            return False
+
+        if automatic_expiration:
+            if detection_service is not None:
+                detection_service.clear_attack_state(ip_address)
+                detection_service.reset_host_state(ip_address)
+
+            self._set_host_status(
+                ip_address,
+                "active",
+                attack_type=None,
+                clear_block=True,
+            )
+            self._mark_attack_resolved(
+                ip_address,
+                status="Expired",
+            )
+            self._schedule_security_refresh()
+
+            self._append_runtime_log(
+                f"El bloqueo automático de {ip_address} expiró y "
+                "las reglas fueron retiradas del router.",
+                level="info",
+            )
+
+        return True
 
     def _format_last_seen(self, timestamp_value):
         if not timestamp_value:
@@ -905,6 +1002,55 @@ class AppController:
                     self._record_event_history(attack.get("type"), normalized_ip, attack.get("victim"), status)
 
         self._schedule_security_refresh()
+
+    def _expire_mikrotik_blocks(self):
+            now = time.time()
+
+            with self.services_lock:
+                mikrotik_manager = self.mikrotik_manager
+
+            if mikrotik_manager is None:
+                return
+
+            expired_blocks = []
+
+            with mikrotik_manager.lock:
+                for ip_address, tracker in mikrotik_manager.blocked_rules.items():
+                    if not tracker.get("automatic", False):
+                        continue
+
+                    expires_at = tracker.get("expires_at")
+                    if expires_at is None:
+                        continue
+
+                    if tracker.get("unblock_queued", False):
+                        continue
+
+                    if now < float(expires_at):
+                        continue
+
+                    tracker["unblock_queued"] = True
+
+                    expired_blocks.append(
+                        {
+                            "ip_address": ip_address,
+                            "mac_address": tracker.get("mac"),
+                        }
+                    )
+
+            for block in expired_blocks:
+                self._queue_mikrotik_action(
+                    "unblock",
+                    ip_address=block["ip_address"],
+                    mac_address=block["mac_address"],
+                    automatic_expiration=True,
+                )
+
+                self._append_runtime_log(
+                    f"El bloqueo automático de {block['ip_address']} alcanzó su duración configurada. "
+                    "Desbloqueo en cola.",
+                    level="info",
+                )
 
     def _expire_inactive_attacks(self):
         now = time.time()
@@ -1672,6 +1818,7 @@ class AppController:
 
     def process_ui_queue(self):
         self._expire_inactive_attacks()
+        self._expire_mikrotik_blocks()
         packet_batch = []
         with self.packet_buffer_lock:
             if self.packet_buffer:

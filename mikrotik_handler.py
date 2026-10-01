@@ -1,7 +1,11 @@
 import logging
 import threading
+import time
 
 import routeros_api
+
+print("### MIKROTIK MODULE LOADED ###")
+print("### FILE:", __file__)
 
 
 DEBUG = False
@@ -197,7 +201,16 @@ class MikroTikManager:
         return resource.add(**params)
 
     def _ensure_rule(self, resource, resource_rules, tracker_bucket, comment, params, rule_label):
-        existing_rule = self._find_rule_by_comment(resource, comment, cached_rules=resource_rules)
+        print(f"[DEBUG ENSURE] START label={rule_label}")
+
+        print("[DEBUG ENSURE] BEFORE find_rule")
+        existing_rule = self._find_rule_by_comment(
+            resource,
+            comment,
+            cached_rules=resource_rules,
+        )
+        print(f"[DEBUG ENSURE] AFTER find_rule existing={bool(existing_rule)}")
+
         if existing_rule:
             rule_id = self._get_rule_id(existing_rule)
             if rule_id:
@@ -205,14 +218,32 @@ class MikroTikManager:
             logging.info("[MIKROTIK] %s already exists", rule_label)
             return
 
-        add_result = self._add_rule_at_top(resource, params, resource_rules=resource_rules)
+        print("[DEBUG ENSURE] BEFORE add_rule")
+
+        add_result = self._add_rule_at_top(
+            resource,
+            params,
+            resource_rules=resource_rules,
+        )
+
+        print(f"[DEBUG ENSURE] AFTER add_rule result={add_result}")
+
         rule_id = self._extract_added_rule_id(add_result)
+
         if not rule_id:
+            print("[DEBUG ENSURE] BEFORE find_created_rule")
             created_rule = self._find_rule_by_comment(resource, comment)
+            print(
+                f"[DEBUG ENSURE] AFTER find_created_rule "
+                f"exists={bool(created_rule)}"
+            )
             rule_id = self._get_rule_id(created_rule) if created_rule else None
+
         if rule_id:
             tracker_bucket.append(rule_id)
+
         logging.info("[MIKROTIK] Added %s", rule_label)
+        print(f"[DEBUG ENSURE] END label={rule_label}")
 
     def _block_raw(self, resources, normalized_ip, comments, tracker):
         raw_rules = resources["raw"].get()
@@ -291,16 +322,25 @@ class MikroTikManager:
             self._ensure_rule(resources["filter"], filter_rules, tracker["filter_rule_ids"], comment, params, label)
 
     def _block_bridge(self, resources, normalized_mac, comments, tracker):
+        print(f"[DEBUG BRIDGE] START mac={normalized_mac}")
+
         if not normalized_mac:
+            print("[DEBUG BRIDGE] No normalized MAC, return")
             return
 
+        print("[DEBUG BRIDGE] BEFORE bridge.get()")
         bridge_rules = resources["bridge"].get()
+        print(f"[DEBUG BRIDGE] AFTER bridge.get() rules={len(bridge_rules)}")
+
         params = {
             "chain": "forward",
-            "src-mac-address": normalized_mac,
+            "src-mac-address": f"{normalized_mac}/ff:ff:ff:ff:ff:ff",
             "action": "drop",
             "comment": comments["bridge_src"],
         }
+
+        print("[DEBUG BRIDGE] BEFORE _ensure_rule()")
+
         self._ensure_rule(
             resources["bridge"],
             bridge_rules,
@@ -310,7 +350,9 @@ class MikroTikManager:
             f"bridge source rule for {normalized_mac}",
         )
 
-    def block_ip(self, ip_address, mac_address=None):
+        print("[DEBUG BRIDGE] AFTER _ensure_rule()")
+
+    def block_ip(self, ip_address, mac_address=None, block_duration_s=None):
         normalized_ip = self._normalize_ip(ip_address)
         normalized_mac = self._normalize_mac(mac_address)
         if not normalized_ip:
@@ -328,6 +370,7 @@ class MikroTikManager:
         comments = self._comment_map(normalized_ip)
 
         def _block():
+            print(f"[DEBUG BLOCK FLOW] START ip={normalized_ip}")
             resources = self._resource_bundle()
             already_blocked = self.is_ip_blocked_in_router(normalized_ip)
             tracker = {
@@ -338,12 +381,44 @@ class MikroTikManager:
                 "comments": self._flatten_comments(comments),
             }
 
+            print("[DEBUG BLOCK] después de _block_raw")
             self._block_raw(resources, normalized_ip, comments, tracker)
+            print(f"[DEBUG BLOCK FLOW] RAW DONE ip={normalized_ip}")
+
+            print("[DEBUG BLOCK] después de _block_filter")
             self._block_filter(resources, normalized_ip, comments, tracker)
+            print(f"[DEBUG BLOCK FLOW] FILTER DONE ip={normalized_ip}")
+
+            print("[DEBUG BLOCK] después de _block_bridge")
             self._block_bridge(resources, normalized_mac, comments, tracker)
+            print(f"[DEBUG BLOCK FLOW] BRIDGE DONE ip={normalized_ip}")
+
+            print("[DEBUG BLOCK] antes de clear_connections")
+            print(f"[DEBUG BLOCK FLOW] BEFORE CLEAR ip={normalized_ip}")
+
             self.clear_connections(normalized_ip, resource_bundle=resources)
 
+            print(f"[DEBUG BLOCK FLOW] AFTER CLEAR ip={normalized_ip}")
+            print("[DEBUG BLOCK] después de clear_connections")
+
+            if block_duration_s is not None:
+                blocked_at = time.time()
+                tracker["blocked_at"] = blocked_at
+                tracker["expires_at"] = blocked_at + float(block_duration_s)
+                tracker["block_duration_s"] = float(block_duration_s)
+                tracker["automatic"] = True
+            else:
+                tracker["automatic"] = False
+
+            print(f"[DEBUG BLOCK FLOW] BEFORE TRACKER ip={normalized_ip}")
+
             self.blocked_rules[normalized_ip] = tracker
+
+            print(
+                "[DEBUG BLOCKED_RULES]",
+                normalized_ip,
+                self.blocked_rules.get(normalized_ip)
+            )
             if already_blocked:
                 logging.info(
                     "[MIKROTIK] Block rules already existed; validated and refreshed ip=%s mac=%s",
@@ -422,7 +497,11 @@ class MikroTikManager:
             connections = (resource_bundle or self._resource_bundle())["connections"]
             removed = 0
 
-            for connection in connections.get():
+            print("[DEBUG CONNECTIONS] antes de connections.get()")
+            connection_list = connections.get()
+            print(f"[DEBUG CONNECTIONS] después de connections.get() cantidad={len(connection_list)}")
+
+            for connection in connection_list:
                 src_address = str(connection.get("src-address", "")).strip()
                 dst_address = str(connection.get("dst-address", "")).strip()
                 base_src_ip = src_address.split(":")[0] if src_address else ""
@@ -441,9 +520,19 @@ class MikroTikManager:
             result = _clear() if resource_bundle is not None else self._run_with_retry(_clear)
             return bool(result)
 
-    def block_attacker(self, ip_address, mac_address=None, attack_type="Unknown"):
+    def block_attacker(
+            self,
+            ip_address,
+            mac_address=None,
+            attack_type="Unknown",
+            block_duration_s=None,
+    ):
         _ = attack_type
-        return self.block_ip(ip_address, mac_address)
+        return self.block_ip(
+            ip_address,
+            mac_address,
+            block_duration_s=block_duration_s,
+        )
 
     def unblock_attacker(self, ip_address, mac_address=None):
         return self.unblock_ip(ip_address, mac_address)

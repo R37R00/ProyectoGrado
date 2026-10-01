@@ -31,12 +31,11 @@
         "lock_gateway_enabled": false,
         "aggressive_mode": false
     },
+    "mitigation": {
+        "block_duration_s": 10.0
+    },
     "whitelist": {
-        "ips": [
-            "10.0.0.100"
-        ],
-        "macs": [
-            "00:0c:29:9e:a1:fa"
-        ]
+        "ips": [],
+        "macs": []
     }
 }
